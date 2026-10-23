@@ -274,7 +274,13 @@ find_start_point (GstMediaSourceSampleMap * self, GSequenceIter * it,
       goto done;
     }
 
-    if (group->start >= earliest && group->end <= latest) {
+    /* MSE, coded frame removal: "Remove all media data, from this track
+     * buffer, that contain starting timestamps greater than or equal to
+     * start and less than the remove end timestamp", then "all coded frames
+     * ... between those frames removed in the previous step and the next
+     * random access point after those removed frames". A group starting in
+     * the range goes whole, even when it ends after the range. */
+    if (group->start >= earliest && group->start < latest) {
       GST_TRACE_OBJECT (self, "found start point for %" GST_TIMEP_FORMAT ": "
           TIME_RANGE_FORMAT, &earliest, CODED_FRAME_GROUP_ARGS (group));
       *to_remove = g_list_prepend (*to_remove,
@@ -306,7 +312,9 @@ find_end_point (GstMediaSourceSampleMap * self, GSequenceIter * it, GList **
           "reached end of coded frames before finding end point");
       goto done;
     }
-    if (group->end >= latest) {
+    /* The removal ends at the first group that starts at or after the end
+     * of the range: its first frame is the next random access point. */
+    if (group->start >= latest) {
       GST_TRACE_OBJECT (self, "found end point for %" GST_TIMEP_FORMAT ": "
           TIME_RANGE_FORMAT, &latest, CODED_FRAME_GROUP_ARGS (group));
       goto done;
