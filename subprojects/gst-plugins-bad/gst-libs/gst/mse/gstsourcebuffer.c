@@ -153,6 +153,9 @@ struct _GstSourceBuffer
   /* Bumped by abort so an append task that was waiting on the pipeline
    * knows its append was dropped. */
   guint append_generation;
+  /* Set by the append pipeline's error callback, on its own thread, for the
+   * append task to report; cleared by the parser reset that follows. */
+  gint append_failed;
   gboolean errored;
   gsize size_limit;
   gsize size;
@@ -708,9 +711,11 @@ on_error (GstAppendPipeline * pipeline, gpointer user_data)
 {
   GstSourceBuffer *self = GST_SOURCE_BUFFER (user_data);
 
-  GST_OBJECT_LOCK (self);
-  append_error_unlocked (self);
-  GST_OBJECT_UNLOCK (self);
+  /* Called on one of the append pipeline's own threads, where resetting the
+   * pipeline would join that thread. The append task reports the error and
+   * resets: it waits for the append to finish, or sees the failure when the
+   * next append starts. */
+  g_atomic_int_set (&self->append_failed, TRUE);
 }
 
 static GstMediaSourceTrackBuffer *
@@ -1664,6 +1669,7 @@ reset_parser_state (GstSourceBuffer * self)
   gboolean reset = gst_append_pipeline_reset (self->append_pipeline);
   g_mutex_unlock (&self->reset_lock);
   GST_OBJECT_LOCK (self);
+  g_atomic_int_set (&self->append_failed, FALSE);
   if (reset) {
     clear_errored (self);
   } else {
@@ -1709,7 +1715,8 @@ append_successful_unlocked (GstSourceBuffer * self, gboolean ended)
 static gboolean
 encountered_bad_bytes_unlocked (GstSourceBuffer * self)
 {
-  return gst_append_pipeline_get_failed (self->append_pipeline);
+  return gst_append_pipeline_get_failed (self->append_pipeline)
+      || g_atomic_int_get (&self->append_failed);
 }
 
 static GstBuffer *
