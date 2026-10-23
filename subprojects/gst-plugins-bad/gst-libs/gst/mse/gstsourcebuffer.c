@@ -2253,7 +2253,9 @@ gst_source_buffer_teardown (GstSourceBuffer * self)
 {
   /* As in abort: the append in flight is dropped under the object lock, and
    * the parser is reset without it, since stopping the append pipeline joins
-   * its task, which may need that lock to deliver a sample. */
+   * its task, which may need that lock to deliver a sample. Must be called
+   * without the parent media source's lock, which an append takes while
+   * holding this object's. */
   GST_OBJECT_LOCK (self);
   self->append_generation++;
   clear_pending_data_unlocked (self);
