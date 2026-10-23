@@ -1073,6 +1073,46 @@ source_buffer_disposed (RemoveInHandlerContext * context,
   g_mutex_unlock (&context->mutex);
 }
 
+GST_START_TEST (test_source_buffer_set_append_window_start)
+{
+  /* Proves the append window start can be moved while the window end is
+   * still unbounded, and afterwards to any point before the end. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  GError *error = NULL;
+
+  fail_unless_equals_uint64 (gst_source_buffer_get_append_window_end
+      (source_buffer), GST_CLOCK_TIME_NONE);
+  fail_unless (gst_source_buffer_set_append_window_start (source_buffer,
+          GST_SECOND, &error));
+  g_assert_no_error (error);
+  fail_unless_equals_uint64 (gst_source_buffer_get_append_window_start
+      (source_buffer), GST_SECOND);
+
+  fail_unless (gst_source_buffer_set_append_window_end (source_buffer,
+          3 * GST_SECOND, &error));
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_set_append_window_start (source_buffer,
+          2 * GST_SECOND, &error));
+  g_assert_no_error (error);
+
+  fail_if (gst_source_buffer_set_append_window_start (source_buffer,
+          3 * GST_SECOND, &error));
+  g_assert_error (error, GST_MEDIA_SOURCE_ERROR, GST_MEDIA_SOURCE_ERROR_TYPE);
+  g_clear_error (&error);
+  fail_if (gst_source_buffer_set_append_window_start (source_buffer,
+          GST_CLOCK_TIME_NONE, &error));
+  g_assert_error (error, GST_MEDIA_SOURCE_ERROR, GST_MEDIA_SOURCE_ERROR_TYPE);
+  g_clear_error (&error);
+  fail_unless_equals_uint64 (gst_source_buffer_get_append_window_start
+      (source_buffer), 2 * GST_SECOND);
+
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_source_buffer_buffered_at_update_end)
 {
   /* Proves that when update-end fires for an append, the media it carried
@@ -1635,6 +1675,7 @@ mse_suite (void)
   tcase_add_test (tc_source_buffer,
       test_source_buffer_change_content_type_empty);
   tcase_add_test (tc_source_buffer, test_source_buffer_change_content_type);
+  tcase_add_test (tc_source_buffer, test_source_buffer_set_append_window_start);
   if (have_qtdemux) {
     tcase_add_test (tc_source_buffer,
         test_source_buffer_removed_in_event_handler);
