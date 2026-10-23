@@ -261,6 +261,8 @@ static void on_new_sample (GstAppendPipeline * pipeline,
 static void on_received_init_segment (GstAppendPipeline * pipeline,
     gpointer user_data);
 
+static gsize compute_total_size_unlocked (GstSourceBuffer * self);
+
 #define TRACKS_LOCK(b)   g_mutex_lock(&(b)->tracks_lock)
 #define TRACKS_UNLOCK(b) g_mutex_unlock(&(b)->tracks_lock)
 
@@ -1503,7 +1505,61 @@ gst_source_buffer_remove (GstSourceBuffer * self, GstClockTime start,
     GstClockTime end, GError ** error)
 {
   g_return_val_if_fail (GST_IS_SOURCE_BUFFER (self), FALSE);
+  g_return_val_if_fail (GST_CLOCK_TIME_IS_VALID (start), FALSE);
+
+  /* Range removal algorithm: the coded frames of every track buffer that
+   * fall in [start, end) go, with the update events of an operation. */
+  GST_OBJECT_LOCK (self);
+  if (is_removed_unlocked (self)) {
+    g_set_error (error, GST_MEDIA_SOURCE_ERROR,
+        GST_MEDIA_SOURCE_ERROR_INVALID_STATE,
+        "source buffer has been removed");
+    goto error;
+  }
+  if (is_updating (self)) {
+    g_set_error (error, GST_MEDIA_SOURCE_ERROR,
+        GST_MEDIA_SOURCE_ERROR_INVALID_STATE,
+        "source buffer is still updating");
+    goto error;
+  }
+  if (GST_CLOCK_TIME_IS_VALID (end) && end <= start) {
+    g_set_error (error, GST_MEDIA_SOURCE_ERROR, GST_MEDIA_SOURCE_ERROR_TYPE,
+        "end must be after start");
+    goto error;
+  }
+  /* MSE, remove(): "If the readyState attribute of the parent media source
+   * is in the "ended" state then ... Set the readyState attribute of the
+   * parent media source to "open". Queue a task to fire an event named
+   * sourceopen", as append_buffer() and set_timestamp_offset() do. */
+  if (is_ended_unlocked (self)) {
+    open_parent_unlocked (self);
+  }
+  set_updating (self);
+  schedule_event_unlocked (self, ON_UPDATE_START);
+  GST_OBJECT_UNLOCK (self);
+
+  /* An end of GST_CLOCK_TIME_NONE, the largest value, removes to the end. */
+  TRACKS_LOCK (self);
+  GHashTableIter iter;
+  gpointer value;
+  g_hash_table_iter_init (&iter, self->track_buffers);
+  while (g_hash_table_iter_next (&iter, NULL, &value)) {
+    gst_media_source_track_buffer_remove_range (GST_MEDIA_SOURCE_TRACK_BUFFER
+        (value), start, end);
+  }
+  self->size = compute_total_size_unlocked (self);
+  TRACKS_UNLOCK (self);
+
+  GST_OBJECT_LOCK (self);
+  clear_updating (self);
+  schedule_event_unlocked (self, ON_UPDATE);
+  schedule_event_unlocked (self, ON_UPDATE_END);
+  GST_OBJECT_UNLOCK (self);
   return TRUE;
+
+error:
+  GST_OBJECT_UNLOCK (self);
+  return FALSE;
 }
 
 /**
