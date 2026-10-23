@@ -1048,6 +1048,42 @@ GST_START_TEST (test_source_buffer_buffered_at_update_end)
 
 GST_END_TEST;
 
+GST_START_TEST (test_source_buffer_append_after_abort)
+{
+  /* Proves an append after abort(), which starts over with an
+   * initialization segment, lands in the track buffers the source buffer
+   * already has: its tracks are the same objects as before, so the feeds
+   * keyed by them accept the new media. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+
+  fail_unless (gst_source_buffer_abort (source_buffer, &error));
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 2);
+  fail_unless_equals_int (events.error, 0);
+
+  GArray *buffered = gst_source_buffer_get_buffered (source_buffer, &error);
+  g_assert_no_error (error);
+  fail_unless_equals_int (buffered->len, 1);
+  g_array_unref (buffered);
+
+  source_buffer_events_clear (&events, source_buffer);
+  finish_mp4_source_buffer (media_source, source_buffer);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_source_buffer_removed_in_event_handler)
 {
   /* Proves a source buffer can be removed, and lose its last reference,
@@ -1509,6 +1545,7 @@ mse_suite (void)
         test_source_buffer_removed_in_event_handler);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_buffered_at_update_end);
+    tcase_add_test (tc_source_buffer, test_source_buffer_append_after_abort);
   }
 
   tcase_add_test (tc_append_pipeline, test_append_pipeline_create_and_free);

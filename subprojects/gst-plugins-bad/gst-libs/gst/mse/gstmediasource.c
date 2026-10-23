@@ -993,15 +993,15 @@ error:
 }
 
 static void
-abort_all_source_buffers (GstMediaSource * self)
+mark_all_source_buffers_eos (GstMediaSource * self)
 {
   for (guint i = 0;; i++) {
     GstSourceBuffer *buf = gst_source_buffer_list_index (self->buffers, i);
     if (buf == NULL) {
       return;
     }
-    GST_LOG_OBJECT (self, "shutting down %" GST_PTR_FORMAT, buf);
-    gst_source_buffer_abort (buf, NULL);
+    GST_LOG_OBJECT (self, "marking %" GST_PTR_FORMAT " EOS", buf);
+    gst_source_buffer_mark_eos (buf);
     gst_object_unref (buf);
   }
 }
@@ -1055,7 +1055,7 @@ gst_media_source_end_of_stream (GstMediaSource * self,
       break;
     default:
       update_duration (self);
-      abort_all_source_buffers (self);
+      mark_all_source_buffers_eos (self);
       break;
   }
 
