@@ -654,6 +654,8 @@ n_streams_by_type (GstMseSrc * self, GstMediaSourceTrackType type)
 {
   guint count = 0;
   GHashTableIter iter;
+  /* Init segments add streams on their append pipelines' threads. */
+  STREAMS_LOCK (self);
   g_hash_table_iter_init (&iter, self->streams);
   for (gpointer key; g_hash_table_iter_next (&iter, &key, NULL);) {
     GstMediaSourceTrack *track = GST_MEDIA_SOURCE_TRACK (key);
@@ -663,6 +665,7 @@ n_streams_by_type (GstMseSrc * self, GstMediaSourceTrackType type)
       count++;
     }
   }
+  STREAMS_UNLOCK (self);
   return count;
 }
 
