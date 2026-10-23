@@ -48,6 +48,8 @@ struct _GstMediaSource
 
   GstSourceBufferList *buffers;
   GstSourceBufferList *active_buffers;
+  /* Bumped by each rebuild of active_buffers, under the object lock. */
+  guint active_buffers_generation;
 
   GstMediaSourceRange live_seekable_range;
 
