@@ -2061,14 +2061,39 @@ gboolean
 gst_source_buffer_abort (GstSourceBuffer * self, GError ** error)
 {
   g_return_val_if_fail (GST_IS_SOURCE_BUFFER (self), FALSE);
-  if (gst_append_pipeline_eos (self->append_pipeline) == GST_FLOW_OK) {
-    return TRUE;
-  } else {
+  GST_OBJECT_LOCK (self);
+  if (is_removed_unlocked (self)) {
+    GST_OBJECT_UNLOCK (self);
     g_set_error (error,
         GST_MEDIA_SOURCE_ERROR, GST_MEDIA_SOURCE_ERROR_INVALID_STATE,
-        "failed to abort source buffer");
+        "source buffer has been removed");
     return FALSE;
   }
+  /* Drop whatever append is queued or in flight, as the spec's abort does.
+   * An append task that was waiting for the pipeline sees the generation
+   * change and reports nothing. */
+  gboolean updating = is_updating (self);
+  self->append_generation++;
+  clear_pending_data_unlocked (self);
+  if (updating) {
+    clear_updating (self);
+    schedule_event_unlocked (self, ON_ABORT);
+    schedule_event_unlocked (self, ON_UPDATE_END);
+  }
+  /* MSE, abort(): "Set appendWindowStart to the presentation start time.
+   * Set appendWindowEnd to positive Infinity." The frames are dropped by
+   * this window, not the caller's copy of it. */
+  self->append_window_start = 0;
+  self->append_window_end = GST_CLOCK_TIME_NONE;
+  GST_OBJECT_UNLOCK (self);
+
+  reset_parser_state (self);
+
+  g_object_notify_by_pspec (G_OBJECT (self),
+      properties[PROP_APPEND_WINDOW_START]);
+  g_object_notify_by_pspec (G_OBJECT (self),
+      properties[PROP_APPEND_WINDOW_END]);
+  return TRUE;
 }
 
 gboolean
@@ -2288,6 +2313,24 @@ gst_source_buffer_seek (GstSourceBuffer * self, GstClockTime time)
   self->seek_time = time;
   g_hash_table_foreach (self->track_buffers,
       (GHFunc) seek_track_buffer_unlocked, self);
+  TRACKS_UNLOCK (self);
+}
+
+/* Every track buffer has all its media: once the track feeds have pushed what
+ * is buffered, they push EOS. Called at the end of stream, which must not
+ * reset the parser or touch an append in progress. */
+void
+gst_source_buffer_mark_eos (GstSourceBuffer * self)
+{
+  g_return_if_fail (GST_IS_SOURCE_BUFFER (self));
+
+  TRACKS_LOCK (self);
+  GHashTableIter iter;
+  gpointer value;
+  g_hash_table_iter_init (&iter, self->track_buffers);
+  while (g_hash_table_iter_next (&iter, NULL, &value)) {
+    gst_media_source_track_buffer_eos (GST_MEDIA_SOURCE_TRACK_BUFFER (value));
+  }
   TRACKS_UNLOCK (self);
 }
 
