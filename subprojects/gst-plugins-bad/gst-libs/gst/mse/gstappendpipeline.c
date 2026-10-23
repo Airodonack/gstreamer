@@ -88,6 +88,10 @@ struct _GstAppendPipeline
 
   GstStreamCollection *streams;
   GArray *tracks;
+  /* The tracks before the last reset. The source buffer keeps its track
+   * buffers and feeds for them, so the init segment that follows a reset
+   * gets them back rather than new tracks with the same ids. */
+  GPtrArray *retired_tracks;
 
   gboolean received_init_segment;
   gboolean have_outstanding_samples;
@@ -402,6 +406,21 @@ done:
   gst_message_unref (message);
 }
 
+static GstMediaSourceTrack *
+reuse_or_new_track (GstAppendPipeline * self, GstMediaSourceTrackType type,
+    const gchar * id, GstCaps * caps)
+{
+  for (guint i = 0; i < self->retired_tracks->len; i++) {
+    GstMediaSourceTrack *track = g_ptr_array_index (self->retired_tracks, i);
+    if (gst_media_source_track_get_track_type (track) == type
+        && g_str_equal (gst_media_source_track_get_id (track), id)) {
+      GST_DEBUG_OBJECT (self, "reusing track %s from before the reset", id);
+      return g_ptr_array_steal_index (self->retired_tracks, i);
+    }
+  }
+  return gst_media_source_track_new_with_initial_caps (type, id, caps);
+}
+
 static inline GstAppSink *
 new_appsink (GstAppendPipeline * self, GstStreamType type)
 {
@@ -506,7 +525,7 @@ add_track (GstAppendPipeline * self, GstPad * pad, GstStream * stream,
     .sink = gst_object_ref (appsink),
     .src_pad = gst_object_ref (pad),
     .stream = gst_object_ref (stream),
-    .mse_track = gst_media_source_track_new_with_initial_caps (track_type,
+    .mse_track = reuse_or_new_track (self, track_type,
         GST_OBJECT_NAME (appsink), caps),
     .previous_pts = GST_CLOCK_TIME_NONE,
   };
@@ -766,6 +785,7 @@ gst_append_pipeline_init (GstAppendPipeline * self)
   self->received_init_segment = FALSE;
   self->encountered_error = FALSE;
   self->tracks = new_tracks_array ();
+  self->retired_tracks = g_ptr_array_new_with_free_func (gst_object_unref);
   init_segment_init (&self->init_segment);
 
   g_mutex_init (&self->appends_lock);
@@ -798,6 +818,7 @@ gst_append_pipeline_finalize (GObject * object)
   init_segment_finalize (&self->init_segment);
 
   g_array_free (self->tracks, TRUE);
+  g_ptr_array_unref (self->retired_tracks);
   gst_clear_object (&self->streams);
 
   g_mutex_clear (&self->appends_lock);
@@ -946,6 +967,14 @@ gst_append_pipeline_reset (GstAppendPipeline * self)
     gst_clear_object (&sink_pad);
     gst_element_set_state (GST_ELEMENT (track->sink), GST_STATE_NULL);
     gst_bin_remove (GST_BIN (self->pipeline), GST_ELEMENT (track->sink));
+  }
+
+  g_ptr_array_set_size (self->retired_tracks, 0);
+  for (guint i = 0; i < self->tracks->len; i++) {
+    Track *track = &g_array_index (self->tracks, Track, i);
+    if (track->mse_track != NULL) {
+      g_ptr_array_add (self->retired_tracks, gst_object_ref (track->mse_track));
+    }
   }
 
   init_segment_finalize (&self->init_segment);
