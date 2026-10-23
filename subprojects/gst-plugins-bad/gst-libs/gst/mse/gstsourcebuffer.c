@@ -318,6 +318,13 @@ gst_source_buffer_new (const gchar * content_type, GstObject * parent,
 
   gboolean generate_timestamps = gst_media_source_media_type_generates_timestamp
       (&media_type);
+  /* parsebin needs more than an initialization segment to typefind, so the
+   * tracks, and with them the media element's metadata, would only appear
+   * once a media segment follows. For ISO BMFF the MIME type already says
+   * what the bytes are, and qtdemux can then parse the moov on its own. */
+  gboolean is_iso_bmff = media_type.mime_type != NULL &&
+      (g_ascii_strcasecmp (media_type.mime_type, "video/mp4") == 0 ||
+      g_ascii_strcasecmp (media_type.mime_type, "audio/mp4") == 0);
   gst_media_source_media_type_reset (&media_type);
 
   GstSourceBufferAppendMode append_mode = generate_timestamps
@@ -345,6 +352,12 @@ gst_source_buffer_new (const gchar * content_type, GstObject * parent,
     g_propagate_prefixed_error (error, append_pipeline_error,
         "failed to create source buffer");
     goto error;
+  }
+  if (is_iso_bmff) {
+    GstCaps *caps = gst_caps_new_simple ("video/quicktime", "variant",
+        G_TYPE_STRING, "iso", NULL);
+    gst_append_pipeline_set_caps (self->append_pipeline, caps);
+    gst_caps_unref (caps);
   }
 
   return gst_object_ref_sink (self);
