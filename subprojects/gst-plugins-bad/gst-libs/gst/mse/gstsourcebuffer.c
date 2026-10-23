@@ -103,7 +103,11 @@ typedef struct
 
 typedef struct
 {
-  GWeakRef parent;
+  /* The owning source buffer, which stops and joins this task before it
+   * goes away (see gst_source_buffer_dispose). Not a reference: holding
+   * one, a feed could be the last to let go of the buffer and would then
+   * free, on its own thread, the task and lock it is running under. */
+  GstSourceBuffer *parent;
 
   GstMediaSourceTrack *track;
   GstMediaSourceTrackBuffer *buffer;
@@ -243,6 +247,7 @@ static void append_to_buffer_task_free (AppendToBufferTask * task);
 static void track_feed_task (TrackFeedTask * feed);
 static void clear_track_feed (TrackFeedTask * feed);
 static void stop_track_feed (TrackFeedTask * feed);
+static void stop_track_feeds (GstSourceBuffer * self);
 static void start_track_feed (TrackFeedTask * feed);
 static void reset_track_feed (TrackFeedTask * feed);
 static TrackFeedTask *get_track_feed_unlocked (GstSourceBuffer * self,
@@ -406,6 +411,12 @@ gst_source_buffer_dispose (GObject * object)
 
   gst_clear_object (&self->append_pipeline);
 
+  /* The track feeds run on their own threads with a plain pointer to this
+   * object, so they are stopped and joined here, before anything they use
+   * goes away. This is never one of their threads: a feed holds no
+   * reference. No lock is held meanwhile; a feed takes only its track
+   * buffer's and its track's. */
+  stop_track_feeds (self);
   g_hash_table_remove_all (self->track_feeds);
 
   if (!is_removed_unlocked (self)) {
@@ -781,7 +792,7 @@ add_track_feed_unlocked (GstMediaSourceTrack * track,
   feed->task = task;
   feed->buffer = track_buffer;
   feed->track = gst_object_ref (track);
-  g_weak_ref_init (&feed->parent, self);
+  feed->parent = self;
   feed->cancelled = FALSE;
   g_hash_table_insert (self->track_feeds, track, feed);
 }
@@ -792,7 +803,6 @@ clear_track_feed (TrackFeedTask * feed)
   gst_object_unref (feed->task);
   g_rec_mutex_clear (&feed->lock);
   gst_object_unref (feed->track);
-  g_weak_ref_clear (&feed->parent);
   g_free (feed);
 }
 
@@ -802,7 +812,21 @@ stop_track_feed (TrackFeedTask * feed)
   g_return_if_fail (feed != NULL);
   gst_media_source_track_flush (feed->track);
   g_atomic_int_set (&feed->cancelled, TRUE);
+  /* The feed may be waiting for new data, with its deadline up to a second
+   * away. */
+  gst_media_source_track_buffer_wake (feed->buffer);
   gst_task_join (feed->task);
+}
+
+static void
+stop_track_feeds (GstSourceBuffer * self)
+{
+  GHashTableIter iter;
+  gpointer value;
+  g_hash_table_iter_init (&iter, self->track_feeds);
+  while (g_hash_table_iter_next (&iter, NULL, &value)) {
+    stop_track_feed (value);
+  }
 }
 
 static void
@@ -1998,11 +2022,7 @@ clip_to_seek_time_dts (const GValue * a, const GValue * b)
 static void
 track_feed_task (TrackFeedTask * feed)
 {
-  GstSourceBuffer *self = g_weak_ref_get (&feed->parent);
-  if (self == NULL) {
-    gst_task_stop (feed->task);
-    return;
-  }
+  GstSourceBuffer *self = feed->parent;
   GstMediaSourceTrack *track = feed->track;
   GstMediaSourceTrackBuffer *buffer = feed->buffer;
   GstClockTime time = self->seek_time;
@@ -2057,7 +2077,6 @@ track_feed_task (TrackFeedTask * feed)
   }
   g_clear_pointer (&acc.processed_samples, g_hash_table_unref);
   g_value_unset (&start_dts_value);
-  gst_clear_object (&self);
 }
 
 static void
