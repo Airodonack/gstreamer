@@ -375,7 +375,9 @@ gst_source_buffer_list_remove (GstSourceBufferList * self,
     GstSourceBuffer * buf)
 {
   g_return_val_if_fail (GST_IS_SOURCE_BUFFER_LIST (self), FALSE);
+  GST_OBJECT_LOCK (self);
   gboolean removed = g_ptr_array_remove (self->buffers, buf);
+  GST_OBJECT_UNLOCK (self);
   if (removed) {
     call_source_buffer_removed (self);
     return TRUE;
@@ -388,10 +390,13 @@ void
 gst_source_buffer_list_remove_all (GstSourceBufferList * self)
 {
   g_return_if_fail (GST_IS_SOURCE_BUFFER_LIST (self));
+  GST_OBJECT_LOCK (self);
   if (self->buffers->len < 1) {
+    GST_OBJECT_UNLOCK (self);
     return;
   }
   g_ptr_array_set_size (self->buffers, 0);
+  GST_OBJECT_UNLOCK (self);
   call_source_buffer_removed (self);
 }
 
