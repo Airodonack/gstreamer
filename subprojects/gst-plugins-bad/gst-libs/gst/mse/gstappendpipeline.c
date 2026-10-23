@@ -875,6 +875,25 @@ gst_append_pipeline_reset (GstAppendPipeline * self)
 
   background_task_stop (self->task);
 
+  /* The appsinks of the old tracks stay in the pipeline otherwise, and the
+   * next init segment's appsink of the same name cannot be added, so its
+   * pad link is refused and add_track() aborts. */
+  for (guint i = 0; i < self->tracks->len; i++) {
+    Track *track = &g_array_index (self->tracks, Track, i);
+    if (track->sink == NULL) {
+      continue;
+    }
+    GstPad *sink_pad = gst_element_get_static_pad (GST_ELEMENT (track->sink),
+        "sink");
+    if (track->src_pad != NULL && sink_pad != NULL
+        && gst_pad_is_linked (sink_pad)) {
+      gst_pad_unlink (track->src_pad, sink_pad);
+    }
+    gst_clear_object (&sink_pad);
+    gst_element_set_state (GST_ELEMENT (track->sink), GST_STATE_NULL);
+    gst_bin_remove (GST_BIN (self->pipeline), GST_ELEMENT (track->sink));
+  }
+
   init_segment_finalize (&self->init_segment);
   gst_clear_object (&self->streams);
   g_array_free (self->tracks, TRUE);

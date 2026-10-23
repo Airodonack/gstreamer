@@ -118,6 +118,27 @@ new_sample_with_bytes_and_timing (GBytes * bytes, GstClockTime dts,
 /* How long a test waits for an event from a source buffer's event thread. */
 #define EVENT_TIMEOUT (5 * G_TIME_SPAN_SECOND)
 
+/* A whole test file, for a source buffer to take ownership of. */
+static GstBuffer *
+test_file_buffer (const gchar * name)
+{
+  GError *error = NULL;
+  gchar *filename = g_build_filename (GST_TEST_FILES_PATH, name, NULL);
+  gchar *data;
+  gsize length;
+  g_file_get_contents (filename, &data, &length, &error);
+  g_assert_no_error (error);
+  g_free (filename);
+  return gst_buffer_new_wrapped (data, length);
+}
+
+/* The whole of mse.mp4, for a source buffer to take ownership of. */
+static GstBuffer *
+test_mp4_buffer (void)
+{
+  return test_file_buffer ("mse.mp4");
+}
+
 /* An open media source with one MP4 source buffer, the usual fixture for
  * the source buffer tests. */
 static GstSourceBuffer *
@@ -589,6 +610,34 @@ GST_START_TEST (test_append_pipeline_reset_recovery)
   test_append_pipeline_await_eos (pipeline, &context);
 
   fail_if (gst_append_pipeline_get_failed (pipeline));
+
+  gst_object_unref (pipeline);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_append_pipeline_reset_after_init_segment)
+{
+  /* Proves a pipeline that has parsed an initialization segment parses the
+   * same one again after a reset: the sinks of its old tracks are gone, so
+   * the new tracks, with the same names, can be linked. */
+  AppendPipelineTestContext context = { 0 };
+  GstAppendPipelineCallbacks callbacks = {
+    .eos = test_append_pipeline_eos,
+    .error = test_append_pipeline_error,
+  };
+  GstAppendPipeline *pipeline =
+      gst_append_pipeline_new (&callbacks, &context, NULL);
+
+  for (guint round = 0; round < 2; round++) {
+    fail_unless (gst_append_pipeline_append (pipeline,
+            test_mp4_buffer ()) == GST_FLOW_OK);
+    gst_append_pipeline_eos (pipeline);
+    test_append_pipeline_await_eos (pipeline, &context);
+    fail_if (gst_append_pipeline_get_failed (pipeline));
+    fail_unless_equals_int (gst_append_pipeline_n_tracks (pipeline), 3);
+    fail_unless (gst_append_pipeline_reset (pipeline));
+  }
 
   gst_object_unref (pipeline);
 }
@@ -1317,6 +1366,10 @@ mse_suite (void)
   tcase_add_test (tc_append_pipeline,
       test_append_pipeline_invalid_data_triggers_error);
   tcase_add_test (tc_append_pipeline, test_append_pipeline_reset_recovery);
+  if (have_qtdemux) {
+    tcase_add_test (tc_append_pipeline,
+        test_append_pipeline_reset_after_init_segment);
+  }
 
   tcase_add_test (tc_track, test_track_create_and_free);
   tcase_add_test (tc_track, test_track_create_with_invalid_type);
