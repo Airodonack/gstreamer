@@ -978,6 +978,10 @@ gst_media_source_remove_source_buffer (GstMediaSource * self,
 
   gst_object_unparent (GST_OBJECT (buffer));
   gst_source_buffer_list_remove (self->buffers, buffer);
+  /* A rebuild walking the list one index at a time has had it shift under
+   * it and would skip the buffer after this one. Its generation check now
+   * starts it over. */
+  self->active_buffers_generation++;
 
   GST_OBJECT_UNLOCK (self);
 
