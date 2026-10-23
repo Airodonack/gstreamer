@@ -309,46 +309,6 @@ mp4_source_buffer (GstMediaSource ** media_source)
   return source_buffer;
 }
 
-/* Releases the fixture of mp4_source_buffer() once media was appended.
- * Each track feed holds a reference to the source buffer while it runs
- * and drops it on its own thread, which must not be the one finalizing
- * the buffer: it still holds the feed's task lock, which finalization
- * frees. So the stream is ended, which lets the feeds push EOS and stop,
- * and the fixture's references go only once theirs are gone. */
-static void
-finish_mp4_source_buffer (GstMediaSource * media_source,
-    GstSourceBuffer * source_buffer)
-{
-  GError *error = NULL;
-  fail_unless (gst_media_source_end_of_stream (media_source,
-          GST_MEDIA_SOURCE_EOS_ERROR_NONE, &error));
-  g_assert_no_error (error);
-
-  /* The parent, the buffer lists and this test. */
-  GstSourceBufferList *active_buffers =
-      gst_media_source_get_active_source_buffers (media_source);
-  guint fixture_refs = 3;
-  for (guint i = 0; i < gst_source_buffer_list_get_length (active_buffers);
-      i++) {
-    GstSourceBuffer *active = gst_source_buffer_list_index (active_buffers, i);
-    if (active == source_buffer) {
-      fixture_refs++;
-    }
-    gst_object_unref (active);
-  }
-  gst_object_unref (active_buffers);
-  gint64 deadline = g_get_monotonic_time () + EVENT_TIMEOUT;
-  while (GST_OBJECT_REFCOUNT_VALUE (source_buffer) > fixture_refs
-      && g_get_monotonic_time () < deadline) {
-    g_usleep (G_TIME_SPAN_MILLISECOND);
-  }
-  fail_unless_equals_int (GST_OBJECT_REFCOUNT_VALUE (source_buffer),
-      fixture_refs);
-
-  gst_object_unref (source_buffer);
-  gst_object_unref (media_source);
-}
-
 GST_START_TEST (test_create_and_free)
 {
   GstMediaSource *media_source = gst_media_source_new ();
@@ -1066,14 +1026,62 @@ GST_START_TEST (test_source_buffer_change_content_type)
 
 GST_END_TEST;
 
+/* Tells, from any thread, whether a watched object has been disposed. */
+typedef struct
+{
+  GMutex mutex;
+  GCond cond;
+  gboolean disposed;
+} DisposeWatch;
+
+static void
+dispose_watch_notify (DisposeWatch * watch, GObject * where_the_object_was)
+{
+  g_mutex_lock (&watch->mutex);
+  watch->disposed = TRUE;
+  g_cond_broadcast (&watch->cond);
+  g_mutex_unlock (&watch->mutex);
+}
+
+static void
+dispose_watch_init (DisposeWatch * watch, gpointer object)
+{
+  g_mutex_init (&watch->mutex);
+  g_cond_init (&watch->cond);
+  watch->disposed = FALSE;
+  g_object_weak_ref (G_OBJECT (object), (GWeakNotify) dispose_watch_notify,
+      watch);
+}
+
+/* Waits until the object is disposed; FALSE if it is not within
+ * EVENT_TIMEOUT. */
+static gboolean
+dispose_watch_await (DisposeWatch * watch)
+{
+  gint64 deadline = g_get_monotonic_time () + EVENT_TIMEOUT;
+  g_mutex_lock (&watch->mutex);
+  gboolean disposed = watch->disposed;
+  while (!disposed
+      && g_cond_wait_until (&watch->cond, &watch->mutex, deadline)) {
+    disposed = watch->disposed;
+  }
+  g_mutex_unlock (&watch->mutex);
+  return disposed;
+}
+
+static void
+dispose_watch_clear (DisposeWatch * watch)
+{
+  g_mutex_clear (&watch->mutex);
+  g_cond_clear (&watch->cond);
+}
+
 typedef struct
 {
   GstMediaSource *media_source;
   /* The test's own reference, dropped inside the handler. */
   GstSourceBuffer *source_buffer;
-  GMutex mutex;
-  GCond cond;
-  gboolean disposed;
+  DisposeWatch watch;
 } RemoveInHandlerContext;
 
 static void
@@ -1083,16 +1091,6 @@ remove_source_buffer_in_handler (GstSourceBuffer * source_buffer,
   gst_media_source_remove_source_buffer (context->media_source,
       source_buffer, NULL);
   gst_clear_object (&context->source_buffer);
-}
-
-static void
-source_buffer_disposed (RemoveInHandlerContext * context,
-    GObject * where_the_object_was)
-{
-  g_mutex_lock (&context->mutex);
-  context->disposed = TRUE;
-  g_cond_broadcast (&context->cond);
-  g_mutex_unlock (&context->mutex);
 }
 
 GST_START_TEST (test_source_buffer_set_append_window_start)
@@ -1160,7 +1158,8 @@ GST_START_TEST (test_source_buffer_buffered_at_update_end)
   g_array_unref (buffered);
 
   source_buffer_events_clear (&events, source_buffer);
-  finish_mp4_source_buffer (media_source, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
 }
 
 GST_END_TEST;
@@ -1196,7 +1195,8 @@ GST_START_TEST (test_source_buffer_append_after_abort)
   g_array_unref (buffered);
 
   source_buffer_events_clear (&events, source_buffer);
-  finish_mp4_source_buffer (media_source, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
 }
 
 GST_END_TEST;
@@ -1236,7 +1236,8 @@ GST_START_TEST (test_source_buffer_parse_error_reported_once)
   g_array_unref (buffered);
 
   source_buffer_events_clear (&events, source_buffer);
-  finish_mp4_source_buffer (media_source, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
 }
 
 GST_END_TEST;
@@ -1272,7 +1273,8 @@ GST_START_TEST (test_source_buffer_remove_range)
   g_array_unref (buffered);
 
   source_buffer_events_clear (&events, source_buffer);
-  finish_mp4_source_buffer (media_source, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
 }
 
 GST_END_TEST;
@@ -1329,7 +1331,8 @@ GST_START_TEST (test_source_buffer_init_segment_alone_activates)
   fail_unless_equals_int (n_active_source_buffers (media_source), 1);
 
   source_buffer_events_clear (&events, source_buffer);
-  finish_mp4_source_buffer (media_source, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
 
   source_buffer = mp4_source_buffer (&media_source);
   source_buffer_events_init (&events, source_buffer);
@@ -1347,7 +1350,8 @@ GST_START_TEST (test_source_buffer_init_segment_alone_activates)
   fail_unless_equals_int (n_active_source_buffers (media_source), 1);
 
   source_buffer_events_clear (&events, source_buffer);
-  finish_mp4_source_buffer (media_source, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
 }
 
 GST_END_TEST;
@@ -1359,30 +1363,19 @@ GST_START_TEST (test_source_buffer_removed_in_event_handler)
    * inside the handler of one of its own events: the handler runs on the
    * buffer's event thread, which is then the thread freeing the buffer. */
   RemoveInHandlerContext context = { 0 };
-  g_mutex_init (&context.mutex);
-  g_cond_init (&context.cond);
   context.source_buffer = mp4_source_buffer (&context.media_source);
-  g_object_weak_ref (G_OBJECT (context.source_buffer),
-      (GWeakNotify) source_buffer_disposed, &context);
+  dispose_watch_init (&context.watch, context.source_buffer);
   g_signal_connect (context.source_buffer, "on-update-end",
       G_CALLBACK (remove_source_buffer_in_handler), &context);
 
-  /* An append of no bytes still ends with update-end, and leaves no media
-   * behind whose track feed would keep the buffer alive. */
+  /* An append of no bytes still ends with update-end. */
   GError *error = NULL;
   fail_unless (gst_source_buffer_append_buffer (context.source_buffer,
           gst_buffer_new (), &error));
   g_assert_no_error (error);
 
-  gint64 deadline = g_get_monotonic_time () + EVENT_TIMEOUT;
-  g_mutex_lock (&context.mutex);
-  gboolean disposed = context.disposed;
-  while (!disposed
-      && g_cond_wait_until (&context.cond, &context.mutex, deadline)) {
-    disposed = context.disposed;
-  }
-  g_mutex_unlock (&context.mutex);
-  fail_unless (disposed, "the source buffer was not freed by its handler");
+  fail_unless (dispose_watch_await (&context.watch),
+      "the source buffer was not freed by its handler");
 
   GstSourceBufferList *buffers =
       gst_media_source_get_source_buffers (context.media_source);
@@ -1390,8 +1383,84 @@ GST_START_TEST (test_source_buffer_removed_in_event_handler)
   gst_object_unref (buffers);
 
   gst_object_unref (context.media_source);
-  g_mutex_clear (&context.mutex);
-  g_cond_clear (&context.cond);
+  dispose_watch_clear (&context.watch);
+}
+
+GST_END_TEST;
+
+/* An MP4 source buffer with mse.mp4 appended, its tracks fed. */
+static GstSourceBuffer *
+mp4_source_buffer_with_media (GstMediaSource ** media_source)
+{
+  GstSourceBuffer *source_buffer = mp4_source_buffer (media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+  fail_unless_equals_int (events.error, 0);
+  source_buffer_events_clear (&events, source_buffer);
+  return source_buffer;
+}
+
+GST_START_TEST (test_source_buffer_freed_when_removed)
+{
+  /* Proves a source buffer holding media is freed once the application
+   * has removed it and let go of it, and likewise when the application
+   * lets go of the media source, instead of living on with its track
+   * feeds polling for data. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer_with_media (&media_source);
+  DisposeWatch watch;
+  dispose_watch_init (&watch, source_buffer);
+  GError *error = NULL;
+
+  fail_unless (gst_media_source_remove_source_buffer (media_source,
+          source_buffer, &error));
+  g_assert_no_error (error);
+  gst_object_unref (source_buffer);
+  fail_unless (dispose_watch_await (&watch),
+      "the removed source buffer was not freed");
+  dispose_watch_clear (&watch);
+  gst_object_unref (media_source);
+
+  source_buffer = mp4_source_buffer_with_media (&media_source);
+  dispose_watch_init (&watch, source_buffer);
+
+  gst_object_unref (media_source);
+  gst_object_unref (source_buffer);
+  fail_unless (dispose_watch_await (&watch),
+      "the source buffer of a dropped media source was not freed");
+  dispose_watch_clear (&watch);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_source_buffer_freed_at_end_of_stream)
+{
+  /* Proves the application can let go of a source buffer and its media
+   * source right after ending the stream, while the track feeds are still
+   * pushing the last samples and EOS. Repeated, since it matters which
+   * thread is the last to let go. */
+  for (guint i = 0; i < 5; i++) {
+    GstMediaSource *media_source;
+    GstSourceBuffer *source_buffer =
+        mp4_source_buffer_with_media (&media_source);
+    DisposeWatch watch;
+    dispose_watch_init (&watch, source_buffer);
+    GError *error = NULL;
+
+    fail_unless (gst_media_source_end_of_stream (media_source,
+            GST_MEDIA_SOURCE_EOS_ERROR_NONE, &error));
+    g_assert_no_error (error);
+    gst_object_unref (media_source);
+    gst_object_unref (source_buffer);
+    fail_unless (dispose_watch_await (&watch),
+        "the source buffer was not freed after the end of the stream");
+    dispose_watch_clear (&watch);
+  }
 }
 
 GST_END_TEST;
@@ -1867,6 +1936,9 @@ mse_suite (void)
   if (have_qtdemux) {
     tcase_add_test (tc_source_buffer,
         test_source_buffer_removed_in_event_handler);
+    tcase_add_test (tc_source_buffer, test_source_buffer_freed_when_removed);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_freed_at_end_of_stream);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_buffered_at_update_end);
     tcase_add_test (tc_source_buffer, test_source_buffer_append_after_abort);
