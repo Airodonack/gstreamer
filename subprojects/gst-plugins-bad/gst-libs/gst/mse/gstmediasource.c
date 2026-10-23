@@ -716,7 +716,7 @@ on_received_init_segment (G_GNUC_UNUSED GstSourceBuffer * source_buffer,
     return;
   }
 
-  GPtrArray *all_tracks = g_ptr_array_new ();
+  GPtrArray *all_tracks = g_ptr_array_new_with_free_func (gst_object_unref);
 
   for (guint i = 0;; i++) {
     GstSourceBuffer *buf = gst_source_buffer_list_index (self->buffers, i);
@@ -724,7 +724,7 @@ on_received_init_segment (G_GNUC_UNUSED GstSourceBuffer * source_buffer,
       break;
     }
     GPtrArray *tracks = gst_source_buffer_get_all_tracks (buf);
-    g_ptr_array_extend (all_tracks, tracks, NULL, NULL);
+    g_ptr_array_extend (all_tracks, tracks, (GCopyFunc) gst_object_ref, NULL);
     g_ptr_array_unref (tracks);
     gst_object_unref (buf);
   }

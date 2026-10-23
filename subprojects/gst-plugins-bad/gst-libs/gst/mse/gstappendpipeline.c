@@ -96,6 +96,12 @@ struct _GstAppendPipeline
   gboolean received_init_segment;
   gboolean have_outstanding_samples;
   InitSegment init_segment;
+  /* Guards init_segment's track arrays and received_init_segment: the
+   * streaming thread adds tracks, reset() replaces the arrays, and the
+   * getters copy them for another source buffer's streaming thread, which
+   * collects every buffer's tracks. Never held while calling out, so it
+   * nests inside any other lock. */
+  GMutex init_segment_lock;
 
   gboolean encountered_error;
 
@@ -593,11 +599,14 @@ process_init_segment_track (GstPad * pad, GstAppendPipeline * self)
   switch (result) {
     case ADDED:{
       GstStreamType type = gst_stream_get_stream_type (stream);
+      g_mutex_lock (&self->init_segment_lock);
       GPtrArray *tracks = init_segment_tracks_for (init_segment, type);
-      if (tracks->len < 1) {
+      gboolean first = tracks->len < 1;
+      g_ptr_array_add (tracks, gst_object_ref (mse_track));
+      g_mutex_unlock (&self->init_segment_lock);
+      if (first) {
         gst_media_source_track_set_active (mse_track, TRUE);
       }
-      g_ptr_array_add (tracks, gst_object_ref (mse_track));
       break;
     }
     case IGNORED:
@@ -678,7 +687,9 @@ process_init_segment (GstAppendPipeline * self)
   GST_DEBUG_OBJECT (self, "init segment says duration=%" GST_TIME_FORMAT,
       GST_TIME_ARGS ((GstClockTime) duration));
 
+  g_mutex_lock (&self->init_segment_lock);
   self->received_init_segment = TRUE;
+  g_mutex_unlock (&self->init_segment_lock);
 
   call_received_init_segment (self);
 
@@ -787,6 +798,7 @@ gst_append_pipeline_init (GstAppendPipeline * self)
   self->tracks = new_tracks_array ();
   self->retired_tracks = g_ptr_array_new_with_free_func (gst_object_unref);
   init_segment_init (&self->init_segment);
+  g_mutex_init (&self->init_segment_lock);
 
   g_mutex_init (&self->appends_lock);
   g_cond_init (&self->appends_cond);
@@ -821,6 +833,7 @@ gst_append_pipeline_finalize (GObject * object)
   g_ptr_array_unref (self->retired_tracks);
   gst_clear_object (&self->streams);
 
+  g_mutex_clear (&self->init_segment_lock);
   g_mutex_clear (&self->appends_lock);
   g_cond_clear (&self->appends_cond);
 
@@ -977,15 +990,22 @@ gst_append_pipeline_reset (GstAppendPipeline * self)
     }
   }
 
-  init_segment_finalize (&self->init_segment);
+  /* Another source buffer's streaming thread may be copying the
+   * initialization segment's tracks: swap in empty arrays under the lock
+   * and free the old ones after. */
+  g_mutex_lock (&self->init_segment_lock);
+  InitSegment old_init_segment = self->init_segment;
+  init_segment_init (&self->init_segment);
+  self->received_init_segment = FALSE;
+  g_mutex_unlock (&self->init_segment_lock);
+  init_segment_finalize (&old_init_segment);
+
   gst_clear_object (&self->streams);
   g_array_free (self->tracks, TRUE);
 
-  self->received_init_segment = FALSE;
   self->have_outstanding_samples = FALSE;
   self->encountered_error = FALSE;
   self->tracks = new_tracks_array ();
-  init_segment_init (&self->init_segment);
 
   g_mutex_lock (&self->appends_lock);
   self->appends_in_flight = 0;
@@ -1034,37 +1054,43 @@ gst_append_pipeline_get_duration (GstAppendPipeline * self)
   }
 }
 
+/* The getters return a copy holding a reference to each track, or NULL
+ * before an initialization segment: the caller may be another source
+ * buffer's streaming thread, and this buffer's abort() frees the
+ * pipeline's own arrays. Free with g_ptr_array_unref(). */
+static GPtrArray *
+copy_init_segment_tracks (GstAppendPipeline * self, GstStreamType type)
+{
+  GPtrArray *tracks = NULL;
+  g_mutex_lock (&self->init_segment_lock);
+  if (self->received_init_segment) {
+    tracks = g_ptr_array_copy (init_segment_tracks_for (&self->init_segment,
+            type), (GCopyFunc) gst_object_ref, NULL);
+    g_ptr_array_set_free_func (tracks, gst_object_unref);
+  }
+  g_mutex_unlock (&self->init_segment_lock);
+  return tracks;
+}
+
 GPtrArray *
 gst_append_pipeline_get_audio_tracks (GstAppendPipeline * self)
 {
   g_return_val_if_fail (GST_IS_APPEND_PIPELINE (self), NULL);
-  if (self->received_init_segment) {
-    return self->init_segment.audio_tracks;
-  } else {
-    return NULL;
-  }
+  return copy_init_segment_tracks (self, GST_STREAM_TYPE_AUDIO);
 }
 
 GPtrArray *
 gst_append_pipeline_get_text_tracks (GstAppendPipeline * self)
 {
   g_return_val_if_fail (GST_IS_APPEND_PIPELINE (self), NULL);
-  if (self->received_init_segment) {
-    return self->init_segment.text_tracks;
-  } else {
-    return NULL;
-  }
+  return copy_init_segment_tracks (self, GST_STREAM_TYPE_TEXT);
 }
 
 GPtrArray *
 gst_append_pipeline_get_video_tracks (GstAppendPipeline * self)
 {
   g_return_val_if_fail (GST_IS_APPEND_PIPELINE (self), NULL);
-  if (self->received_init_segment) {
-    return self->init_segment.video_tracks;
-  } else {
-    return NULL;
-  }
+  return copy_init_segment_tracks (self, GST_STREAM_TYPE_VIDEO);
 }
 
 gboolean
