@@ -857,7 +857,6 @@ rebuild_active_source_buffers (GstMediaSource * self)
         gst_source_buffer_list_append (self->active_buffers, buf);
         added |= !g_hash_table_contains (previously_active, buf);
       } else {
-        gst_source_buffer_list_append (self->active_buffers, buf);
         removed |= g_hash_table_contains (previously_active, buf);
       }
     }
