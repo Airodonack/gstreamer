@@ -1219,6 +1219,72 @@ GST_START_TEST (test_source_buffer_parse_error_reported_once)
 
 GST_END_TEST;
 
+GST_START_TEST (test_source_buffer_remove_range)
+{
+  /* Proves remove() takes the media out of the buffered ranges, as an
+   * update with its events. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+  GArray *buffered = gst_source_buffer_get_buffered (source_buffer, &error);
+  g_assert_no_error (error);
+  fail_unless_equals_int (buffered->len, 1);
+  g_array_unref (buffered);
+
+  fail_unless (gst_source_buffer_remove (source_buffer, 0,
+          GST_CLOCK_TIME_NONE, &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 2);
+  fail_if (gst_source_buffer_get_updating (source_buffer));
+  fail_unless_equals_int (events.error, 0);
+  buffered = gst_source_buffer_get_buffered (source_buffer, &error);
+  g_assert_no_error (error);
+  fail_unless_equals_int (buffered->len, 0);
+  g_array_unref (buffered);
+
+  source_buffer_events_clear (&events, source_buffer);
+  finish_mp4_source_buffer (media_source, source_buffer);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_source_buffer_remove_reopens_ended_source)
+{
+  /* Proves remove() on a buffer of an ended media source reopens the
+   * source, as appending does. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  fail_unless (gst_media_source_end_of_stream (media_source,
+          GST_MEDIA_SOURCE_EOS_ERROR_NONE, &error));
+  g_assert_no_error (error);
+  fail_unless_equals_int (gst_media_source_get_ready_state (media_source),
+      GST_MEDIA_SOURCE_READY_STATE_ENDED);
+
+  fail_unless (gst_source_buffer_remove (source_buffer, 0,
+          GST_CLOCK_TIME_NONE, &error));
+  g_assert_no_error (error);
+  fail_unless_equals_int (gst_media_source_get_ready_state (media_source),
+      GST_MEDIA_SOURCE_READY_STATE_OPEN);
+  await_update_end (&events, 1);
+
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_source_buffer_removed_in_event_handler)
 {
   /* Proves a source buffer can be removed, and lose its last reference,
@@ -1528,6 +1594,58 @@ GST_START_TEST (test_sample_map_remove_range_removes_coded_frame_group)
 
 GST_END_TEST;
 
+typedef struct
+{
+  GstClockTime start;
+  GstClockTime end;
+  /* Whether each of the three coded frame groups is removed. */
+  gboolean removed[3];
+} RemoveRangeCase;
+
+static const RemoveRangeCase remove_range_cases[] = {
+  /* A group that starts inside the range goes whole, past the range's
+   * end. */
+  {2, 3, {FALSE, TRUE, FALSE}},
+  /* A group that ends exactly at the range's end is inside it. */
+  {0, 4, {TRUE, TRUE, FALSE}},
+};
+
+GST_START_TEST (test_sample_map_remove_range_group_boundaries)
+{
+  /* Proves which coded frame groups a range removes: those that start in
+   * it, whole, and the ones after them up to the first group that starts
+   * at or after the end of the range. */
+  GstMediaSourceSampleMap *map = gst_media_source_sample_map_new ();
+  const RemoveRangeCase *testcase = &remove_range_cases[__i__];
+
+  /* Three groups of a key frame and a delta frame, one time unit each:
+   * [0, 2), [2, 4) and [4, 6). */
+  GstSample *samples[6];
+  for (guint i = 0; i < G_N_ELEMENTS (samples); i++) {
+    samples[i] = new_empty_sample_with_timing_and_flags (i, i, 1,
+        i % 2 == 0 ? 0 : GST_BUFFER_FLAG_DELTA_UNIT);
+    gst_media_source_sample_map_add (map, samples[i]);
+  }
+
+  gst_media_source_sample_map_remove_range (map, testcase->start,
+      testcase->end);
+
+  for (guint i = 0; i < G_N_ELEMENTS (samples); i++) {
+    if (testcase->removed[i / 2]) {
+      fail_if (gst_media_source_sample_map_contains (map, samples[i]),
+          "sample %u should have been removed", i);
+    } else {
+      fail_unless (gst_media_source_sample_map_contains (map, samples[i]),
+          "sample %u should have been kept", i);
+    }
+    gst_sample_unref (samples[i]);
+  }
+
+  gst_object_unref (map);
+}
+
+GST_END_TEST;
+
 static void
 sample_map_iterate_size (const GValue * item, gpointer user_data)
 {
@@ -1676,6 +1794,8 @@ mse_suite (void)
       test_source_buffer_change_content_type_empty);
   tcase_add_test (tc_source_buffer, test_source_buffer_change_content_type);
   tcase_add_test (tc_source_buffer, test_source_buffer_set_append_window_start);
+  tcase_add_test (tc_source_buffer,
+      test_source_buffer_remove_reopens_ended_source);
   if (have_qtdemux) {
     tcase_add_test (tc_source_buffer,
         test_source_buffer_removed_in_event_handler);
@@ -1684,6 +1804,7 @@ mse_suite (void)
     tcase_add_test (tc_source_buffer, test_source_buffer_append_after_abort);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_parse_error_reported_once);
+    tcase_add_test (tc_source_buffer, test_source_buffer_remove_range);
   }
 
   tcase_add_test (tc_append_pipeline, test_append_pipeline_create_and_free);
@@ -1717,6 +1838,9 @@ mse_suite (void)
       test_sample_map_remove_range_removes_coded_frame_group, 0, 2);
   tcase_add_test (tc_sample_map,
       test_sample_map_remove_range_from_start_byte_count);
+  tcase_add_loop_test (tc_sample_map,
+      test_sample_map_remove_range_group_boundaries, 0,
+      G_N_ELEMENTS (remove_range_cases));
   tcase_add_test (tc_sample_map, test_sample_map_empty_iterator_by_dts);
   tcase_add_test (tc_sample_map, test_sample_map_grouped_iterator_by_dts);
 
