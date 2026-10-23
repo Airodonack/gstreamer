@@ -37,7 +37,8 @@ struct _GstMseEventQueue
   gpointer user_data;
 
   GstTask *task;
-  GRecMutex lock;
+  /* The thread running task_func, so finalize can tell it is on it. */
+  GThread *thread;
   GstDataQueue *queue;
 };
 
@@ -74,8 +75,16 @@ gst_mse_background_event_queue_finalize (GObject * obj)
 {
   GstMseEventQueue *self = GST_MSE_EVENT_QUEUE (obj);
 
-  gst_task_join (self->task);
-  g_rec_mutex_clear (&self->lock);
+  /* The callback can drop the last reference, for example a source buffer
+   * whose owner let go of it while one of its events was being dispatched, and
+   * then this runs on the task's own thread, which cannot join itself. Stopping
+   * is enough there: the task holds its own reference, its lock belongs to the
+   * task (see gst_mse_event_queue_init), and task_func does not touch the queue
+   * after the callback returns. */
+  gst_task_stop (self->task);
+  if (g_atomic_pointer_get (&self->thread) != g_thread_self ()) {
+    gst_task_join (self->task);
+  }
   gst_clear_object (&self->task);
   gst_clear_object (&self->queue);
 
@@ -98,6 +107,7 @@ task_func (GstMseEventQueue * self)
   GstTask *task = self->task;
   GstDataQueue *queue = self->queue;
   GstDataQueueItem *item = NULL;
+  g_atomic_pointer_set (&self->thread, g_thread_self ());
   if (!gst_data_queue_pop (queue, &item)) {
     gst_task_stop (task);
     return;
@@ -115,13 +125,27 @@ never_full (GstDataQueue * queue, guint visible, guint bytes, guint64 time,
   return FALSE;
 }
 
+static void
+free_task_lock (GRecMutex * lock)
+{
+  g_rec_mutex_clear (lock);
+  g_free (lock);
+}
+
 void
 gst_mse_event_queue_init (GstMseEventQueue * self)
 {
   self->queue = gst_data_queue_new (never_full, NULL, NULL, NULL);
   self->task = gst_task_new ((GstTaskFunction) task_func, self, NULL);
-  g_rec_mutex_init (&self->lock);
-  gst_task_set_lock (self->task, &self->lock);
+  /* The task's thread holds this lock for as long as it runs, which can
+   * outlast the queue when the queue is finalized on that thread, so the lock
+   * lives as long as the task object, which the thread keeps a reference to
+   * until it has released the lock. */
+  GRecMutex *lock = g_new (GRecMutex, 1);
+  g_rec_mutex_init (lock);
+  gst_task_set_lock (self->task, lock);
+  g_object_set_data_full (G_OBJECT (self->task), "gst-mse-event-queue-lock",
+      lock, (GDestroyNotify) free_task_lock);
 }
 
 gboolean

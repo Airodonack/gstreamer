@@ -115,6 +115,21 @@ new_sample_with_bytes_and_timing (GBytes * bytes, GstClockTime dts,
   return sample;
 }
 
+/* How long a test waits for an event from a source buffer's event thread. */
+#define EVENT_TIMEOUT (5 * G_TIME_SPAN_SECOND)
+
+/* An open media source with one MP4 source buffer, the usual fixture for
+ * the source buffer tests. */
+static GstSourceBuffer *
+mp4_source_buffer (GstMediaSource ** media_source)
+{
+  *media_source = opened_media_source ();
+  GstSourceBuffer *source_buffer =
+      gst_media_source_add_source_buffer (*media_source, "video/mp4", NULL);
+  fail_unless (GST_IS_SOURCE_BUFFER (source_buffer));
+  return source_buffer;
+}
+
 GST_START_TEST (test_create_and_free)
 {
   GstMediaSource *media_source = gst_media_source_new ();
@@ -804,6 +819,78 @@ GST_START_TEST (test_source_buffer_change_content_type)
 
 GST_END_TEST;
 
+typedef struct
+{
+  GstMediaSource *media_source;
+  /* The test's own reference, dropped inside the handler. */
+  GstSourceBuffer *source_buffer;
+  GMutex mutex;
+  GCond cond;
+  gboolean disposed;
+} RemoveInHandlerContext;
+
+static void
+remove_source_buffer_in_handler (GstSourceBuffer * source_buffer,
+    RemoveInHandlerContext * context)
+{
+  gst_media_source_remove_source_buffer (context->media_source,
+      source_buffer, NULL);
+  gst_clear_object (&context->source_buffer);
+}
+
+static void
+source_buffer_disposed (RemoveInHandlerContext * context,
+    GObject * where_the_object_was)
+{
+  g_mutex_lock (&context->mutex);
+  context->disposed = TRUE;
+  g_cond_broadcast (&context->cond);
+  g_mutex_unlock (&context->mutex);
+}
+
+GST_START_TEST (test_source_buffer_removed_in_event_handler)
+{
+  /* Proves a source buffer can be removed, and lose its last reference,
+   * inside the handler of one of its own events: the handler runs on the
+   * buffer's event thread, which is then the thread freeing the buffer. */
+  RemoveInHandlerContext context = { 0 };
+  g_mutex_init (&context.mutex);
+  g_cond_init (&context.cond);
+  context.source_buffer = mp4_source_buffer (&context.media_source);
+  g_object_weak_ref (G_OBJECT (context.source_buffer),
+      (GWeakNotify) source_buffer_disposed, &context);
+  g_signal_connect (context.source_buffer, "on-update-end",
+      G_CALLBACK (remove_source_buffer_in_handler), &context);
+
+  /* An append of no bytes still ends with update-end, and leaves no media
+   * behind whose track feed would keep the buffer alive. */
+  GError *error = NULL;
+  fail_unless (gst_source_buffer_append_buffer (context.source_buffer,
+          gst_buffer_new (), &error));
+  g_assert_no_error (error);
+
+  gint64 deadline = g_get_monotonic_time () + EVENT_TIMEOUT;
+  g_mutex_lock (&context.mutex);
+  gboolean disposed = context.disposed;
+  while (!disposed
+      && g_cond_wait_until (&context.cond, &context.mutex, deadline)) {
+    disposed = context.disposed;
+  }
+  g_mutex_unlock (&context.mutex);
+  fail_unless (disposed, "the source buffer was not freed by its handler");
+
+  GstSourceBufferList *buffers =
+      gst_media_source_get_source_buffers (context.media_source);
+  fail_unless_equals_int (gst_source_buffer_list_get_length (buffers), 0);
+  gst_object_unref (buffers);
+
+  gst_object_unref (context.media_source);
+  g_mutex_clear (&context.mutex);
+  g_cond_clear (&context.cond);
+}
+
+GST_END_TEST;
+
 static const gchar *unsupported_content_types[] = {
   "xxx",
   "text/html",
@@ -1166,6 +1253,13 @@ mse_suite (void)
   TCase *tc_track_buffer = new_tcase ("GstMediaSourceTrackBuffer");
   TCase *tc_sample_map = new_tcase ("GstMediaSourceSampleMap");
 
+  /* The tests that parse mse.mp4 need its demuxer, from gst-plugins-good. */
+  gboolean have_qtdemux = gst_registry_check_feature_version (gst_registry_get
+      (), "qtdemux", GST_VERSION_MAJOR, GST_VERSION_MINOR, 0);
+  if (!have_qtdemux) {
+    GST_WARNING ("qtdemux element not available, skipping the MP4 tests");
+  }
+
   tcase_add_test (tc_media_source, test_create_and_free);
   tcase_add_test (tc_media_source, test_create_initial_state);
   tcase_add_test (tc_media_source,
@@ -1210,6 +1304,10 @@ mse_suite (void)
   tcase_add_test (tc_source_buffer,
       test_source_buffer_change_content_type_empty);
   tcase_add_test (tc_source_buffer, test_source_buffer_change_content_type);
+  if (have_qtdemux) {
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_removed_in_event_handler);
+  }
 
   tcase_add_test (tc_append_pipeline, test_append_pipeline_create_and_free);
   tcase_add_test (tc_append_pipeline, test_append_pipeline_mp4);
