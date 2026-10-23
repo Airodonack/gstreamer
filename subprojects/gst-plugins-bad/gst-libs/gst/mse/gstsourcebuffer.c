@@ -119,6 +119,9 @@ typedef struct
   GstSourceBuffer *parent;
   GHashTable *processed_samples;
   gboolean push_failed;
+  /* The highest decode time plus duration of the samples pushed to the
+   * track so far: where the decoder's input has reached. */
+  GstClockTime pushed_dts_end;
 } TrackFeedAccumulator;
 
 typedef struct
@@ -1913,6 +1916,36 @@ track_feed_fold (const GValue * item, TrackFeedAccumulator * acc,
     return FALSE;
   }
 
+  gboolean started = group->samples == NULL
+      || g_hash_table_contains (acc->processed_samples, group->samples->data);
+
+  /* A group that starts behind what was already pushed replaced frames the
+   * track has played or queued, for example a page appending a higher quality
+   * version of the opening seconds. Pushing it now would hand the decoder
+   * frames out of order, so it is skipped; it is still in the buffer for a
+   * later seek. A group the feed has started is one still being appended.
+   * Consecutive fragments can overlap by rounding or by audio priming, by far
+   * less than a frame: half of the group's first frame is allowed for that. */
+  if (!started && GST_CLOCK_TIME_IS_VALID (acc->pushed_dts_end)) {
+    GstBuffer *first =
+        gst_sample_get_buffer (GST_SAMPLE (group->samples->data));
+    GstClockTime slack = GST_BUFFER_DURATION_IS_VALID (first)
+        ? GST_BUFFER_DURATION (first) / 2 : 0;
+    if (group->start + slack < acc->pushed_dts_end) {
+      GST_LOG_OBJECT (self, "%s: skipping group %" GST_TIMEP_FORMAT "-%"
+          GST_TIMEP_FORMAT ", behind pushed position %" GST_TIMEP_FORMAT,
+          gst_media_source_track_get_id (feed->track), &group->start,
+          &group->end, &acc->pushed_dts_end);
+      return TRUE;
+    }
+  }
+
+  if (!started) {
+    GST_LOG_OBJECT (self, "%s: pushing group %" GST_TIMEP_FORMAT "-%"
+        GST_TIMEP_FORMAT, gst_media_source_track_get_id (feed->track),
+        &group->start, &group->end);
+  }
+
   for (GList * it = group->samples; it != NULL; it = g_list_next (it)) {
     GstSample *sample = GST_SAMPLE (it->data);
     if (!g_hash_table_add (acc->processed_samples, gst_sample_ref (sample))) {
@@ -1924,6 +1957,16 @@ track_feed_fold (const GValue * item, TrackFeedAccumulator * acc,
           gst_media_source_track_get_id (feed->track));
       acc->push_failed = TRUE;
       return FALSE;
+    }
+    GstBuffer *buffer = gst_sample_get_buffer (sample);
+    if (GST_BUFFER_DTS_IS_VALID (buffer)) {
+      GstClockTime end = GST_BUFFER_DTS (buffer) +
+          (GST_BUFFER_DURATION_IS_VALID (buffer) ? GST_BUFFER_DURATION (buffer)
+          : 0);
+      if (!GST_CLOCK_TIME_IS_VALID (acc->pushed_dts_end)
+          || end > acc->pushed_dts_end) {
+        acc->pushed_dts_end = end;
+      }
     }
   }
 
@@ -1960,6 +2003,7 @@ track_feed_task (TrackFeedTask * feed)
     .processed_samples = g_hash_table_new_full (g_direct_hash, g_direct_equal,
         (GDestroyNotify) gst_sample_unref, NULL),
     .push_failed = FALSE,
+    .pushed_dts_end = GST_CLOCK_TIME_NONE,
   };
   GValue start_dts_value = G_VALUE_INIT;
   g_value_init (&start_dts_value, G_TYPE_UINT64);
