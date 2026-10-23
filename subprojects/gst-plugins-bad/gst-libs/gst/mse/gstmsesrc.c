@@ -1359,8 +1359,9 @@ update_ready_state_for_init_segment (GstMseSrc * self)
     all_received_init_segment &= gst_source_buffer_has_init_segment (buf);
     gst_object_unref (buf);
   }
+  gst_object_unref (buffers);
   if (!all_received_init_segment) {
-    return;
+    goto done;
   }
   set_ready_state (self, MAX (self->ready_state,
           GST_MSE_SRC_READY_STATE_HAVE_METADATA));
