@@ -139,6 +139,45 @@ test_mp4_buffer (void)
   return test_file_buffer ("mse.mp4");
 }
 
+/* The offset of the first box of the given type in an MP4 buffer. */
+static gsize
+mp4_box_offset (GstBuffer * buffer, const gchar * type)
+{
+  GstMapInfo map;
+  fail_unless (gst_buffer_map (buffer, &map, GST_MAP_READ));
+  gsize offset = 0;
+  while (offset + 8 <= map.size
+      && memcmp (map.data + offset + 4, type, 4) != 0) {
+    offset += GST_READ_UINT32_BE (map.data + offset);
+  }
+  gst_buffer_unmap (buffer, &map);
+  fail_unless (offset > 0 && offset < gst_buffer_get_size (buffer));
+  return offset;
+}
+
+/* The bytes of mse.mp4 before its first box of the given type. */
+static GstBuffer *
+test_mp4_before_box (const gchar * type)
+{
+  GstBuffer *whole = test_mp4_buffer ();
+  GstBuffer *prefix = gst_buffer_copy_region (whole, GST_BUFFER_COPY_MEMORY,
+      0, mp4_box_offset (whole, type));
+  gst_buffer_unref (whole);
+  return prefix;
+}
+
+/* The file type box of mse.mp4 followed by a box whose size field is
+ * smaller than a box header, which the demuxer rejects. The padding gives
+ * typefinding the 2 KiB it wants before it looks at the bytes. */
+static GstBuffer *
+test_mp4_invalid_buffer (void)
+{
+  static const guint8 bogus_box[4096] = { 0, 0, 0, 4, 'm', 'o', 'o', 'v' };
+  GstBuffer *buffer = test_mp4_before_box ("moov");
+  return gst_buffer_append (buffer, gst_buffer_new_memdup (bogus_box,
+          sizeof (bogus_box)));
+}
+
 /* Counts the update-end, error and abort events a source buffer emits, on
  * its event thread, so that a test can wait for them. */
 typedef struct
@@ -215,6 +254,22 @@ await_update_end (SourceBufferEvents * events, guint count)
       g_mutex_unlock (&events->mutex);
       ck_abort_msg ("timed out waiting for update-end %u, have %u", count,
           have);
+    }
+  }
+  g_mutex_unlock (&events->mutex);
+}
+
+/* Waits until the source buffer has emitted error count times. */
+static void
+await_error (SourceBufferEvents * events, guint count)
+{
+  gint64 deadline = g_get_monotonic_time () + EVENT_TIMEOUT;
+  g_mutex_lock (&events->mutex);
+  while (events->error < count) {
+    if (!g_cond_wait_until (&events->cond, &events->mutex, deadline)) {
+      guint have = events->error;
+      g_mutex_unlock (&events->mutex);
+      ck_abort_msg ("timed out waiting for error %u, have %u", count, have);
     }
   }
   g_mutex_unlock (&events->mutex);
@@ -1084,6 +1139,46 @@ GST_START_TEST (test_source_buffer_append_after_abort)
 
 GST_END_TEST;
 
+GST_START_TEST (test_source_buffer_parse_error_reported_once)
+{
+  /* Proves an append of bytes the parser rejects ends with one error and
+   * one update-end, and that the buffer then accepts an append that starts
+   * over with an initialization segment. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_invalid_buffer (), &error));
+  g_assert_no_error (error);
+  await_error (&events, 1);
+  await_update_end (&events, 1);
+  fail_if (gst_source_buffer_get_updating (source_buffer));
+  /* A second report of the same failure would follow at once. */
+  g_usleep (100 * G_TIME_SPAN_MILLISECOND);
+  fail_unless_equals_int (events.error, 1);
+  fail_unless_equals_int (events.update_end, 1);
+  fail_unless_equals_int (gst_media_source_get_ready_state (media_source),
+      GST_MEDIA_SOURCE_READY_STATE_ENDED);
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 2);
+  fail_unless_equals_int (events.error, 1);
+  GArray *buffered = gst_source_buffer_get_buffered (source_buffer, &error);
+  g_assert_no_error (error);
+  fail_unless_equals_int (buffered->len, 1);
+  g_array_unref (buffered);
+
+  source_buffer_events_clear (&events, source_buffer);
+  finish_mp4_source_buffer (media_source, source_buffer);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_source_buffer_removed_in_event_handler)
 {
   /* Proves a source buffer can be removed, and lose its last reference,
@@ -1546,6 +1641,8 @@ mse_suite (void)
     tcase_add_test (tc_source_buffer,
         test_source_buffer_buffered_at_update_end);
     tcase_add_test (tc_source_buffer, test_source_buffer_append_after_abort);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_parse_error_reported_once);
   }
 
   tcase_add_test (tc_append_pipeline, test_append_pipeline_create_and_free);
