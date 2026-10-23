@@ -197,6 +197,16 @@ gst_media_source_track_buffer_await_new_data_until (GstMediaSourceTrackBuffer *
   NEW_DATA_UNLOCK (self);
 }
 
+/* Ends a wait for new data without any, for a track feed being stopped. */
+void
+gst_media_source_track_buffer_wake (GstMediaSourceTrackBuffer * self)
+{
+  g_return_if_fail (GST_IS_MEDIA_SOURCE_TRACK_BUFFER (self));
+  NEW_DATA_LOCK (self);
+  NEW_DATA_SIGNAL (self);
+  NEW_DATA_UNLOCK (self);
+}
+
 gint
 gst_media_source_track_buffer_get_size (GstMediaSourceTrackBuffer * self)
 {

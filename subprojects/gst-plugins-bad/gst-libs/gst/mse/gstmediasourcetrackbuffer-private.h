@@ -82,6 +82,9 @@ void gst_media_source_track_buffer_await_new_data_until (
     GstMediaSourceTrackBuffer * self, gint64 deadline);
 
 GST_MSE_PRIVATE
+void gst_media_source_track_buffer_wake (GstMediaSourceTrackBuffer * self);
+
+GST_MSE_PRIVATE
 gsize gst_media_source_track_buffer_get_storage_size (
     GstMediaSourceTrackBuffer * self);
 
