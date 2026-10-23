@@ -106,7 +106,7 @@ static guint signals[N_SIGNALS];
 #define DEFAULT_DURATION    GST_CLOCK_TIME_NONE
 
 static void rebuild_active_source_buffers (GstMediaSource * self);
-static void detach_unlocked (GstMediaSource * self);
+static GPtrArray *detach_unlocked (GstMediaSource * self);
 static void set_duration_unlocked (GstMediaSource * self,
     GstClockTime duration);
 
@@ -162,18 +162,34 @@ gst_media_source_new (void)
   return g_object_ref_sink (g_object_new (GST_TYPE_MEDIA_SOURCE, NULL));
 }
 
-static inline void
-empty_buffers (GstMediaSource * self)
+/* Takes every source buffer out of the list. The caller unparents them with
+ * release_buffers() once it no longer holds the object lock: unparenting
+ * takes each buffer's lock, and a buffer takes this object's lock while
+ * holding its own. */
+static GPtrArray *
+take_buffers_unlocked (GstMediaSource * self)
 {
+  GPtrArray *buffers = g_ptr_array_new ();
   for (guint i = 0;; i++) {
     GstSourceBuffer *buf = gst_source_buffer_list_index (self->buffers, i);
     if (buf == NULL) {
       break;
     }
-    gst_object_unparent (GST_OBJECT_CAST (buf));
-    gst_object_unref (buf);
+    g_ptr_array_add (buffers, buf);
   }
   gst_source_buffer_list_remove_all (self->buffers);
+  return buffers;
+}
+
+static void
+release_buffers (GPtrArray * buffers)
+{
+  for (guint i = 0; i < buffers->len; i++) {
+    GstObject *buf = g_ptr_array_index (buffers, i);
+    gst_object_unparent (buf);
+    gst_object_unref (buf);
+  }
+  g_ptr_array_unref (buffers);
 }
 
 static void
@@ -181,12 +197,12 @@ gst_media_source_dispose (GObject * object)
 {
   GstMediaSource *self = (GstMediaSource *) object;
 
-  detach_unlocked (self);
+  release_buffers (detach_unlocked (self));
 
   g_clear_object (&self->active_buffers);
 
   if (self->buffers) {
-    empty_buffers (self);
+    release_buffers (take_buffers_unlocked (self));
   }
   gst_clear_object (&self->buffers);
 
@@ -475,9 +491,7 @@ gst_media_source_attach (GstMediaSource * self, GstMseSrc * element)
   g_return_if_fail (GST_IS_MSE_SRC (element));
 
   GST_OBJECT_LOCK (self);
-  if (is_attached (self)) {
-    detach_unlocked (self);
-  }
+  GPtrArray *detached = is_attached (self) ? detach_unlocked (self) : NULL;
 
   self->element = gst_object_ref (element);
   gst_mse_src_attach (element, self);
@@ -485,17 +499,22 @@ gst_media_source_attach (GstMediaSource * self, GstMseSrc * element)
   self->ready_state = GST_MEDIA_SOURCE_READY_STATE_OPEN;
   GST_OBJECT_UNLOCK (self);
 
+  if (detached != NULL) {
+    release_buffers (detached);
+  }
+
   schedule_event (self, ON_SOURCE_OPEN);
 }
 
-static void
+/* Returns the source buffers taken out, for release_buffers(). */
+static GPtrArray *
 detach_unlocked (GstMediaSource * self)
 {
   self->ready_state = GST_MEDIA_SOURCE_READY_STATE_CLOSED;
   set_duration_unlocked (self, GST_CLOCK_TIME_NONE);
 
   gst_source_buffer_list_remove_all (self->active_buffers);
-  empty_buffers (self);
+  GPtrArray *buffers = take_buffers_unlocked (self);
 
   if (is_attached (self)) {
     gst_mse_src_detach (self->element);
@@ -503,6 +522,8 @@ detach_unlocked (GstMediaSource * self)
   }
 
   schedule_event (self, ON_SOURCE_CLOSE);
+
+  return buffers;
 }
 
 /**
@@ -519,8 +540,9 @@ gst_media_source_detach (GstMediaSource * self)
   g_return_if_fail (GST_IS_MEDIA_SOURCE (self));
 
   GST_OBJECT_LOCK (self);
-  detach_unlocked (self);
+  GPtrArray *buffers = detach_unlocked (self);
   GST_OBJECT_UNLOCK (self);
+  release_buffers (buffers);
 }
 
 /**
@@ -971,12 +993,8 @@ gst_media_source_remove_source_buffer (GstMediaSource * self,
     goto error;
   }
 
-  if (gst_source_buffer_get_updating (buffer))
-    gst_source_buffer_teardown (buffer);
-
+  gst_object_ref (buffer);
   gst_source_buffer_list_remove (self->active_buffers, buffer);
-
-  gst_object_unparent (GST_OBJECT (buffer));
   gst_source_buffer_list_remove (self->buffers, buffer);
   /* A rebuild walking the list one index at a time has had it shift under
    * it and would skip the buffer after this one. Its generation check now
@@ -984,6 +1002,14 @@ gst_media_source_remove_source_buffer (GstMediaSource * self,
   self->active_buffers_generation++;
 
   GST_OBJECT_UNLOCK (self);
+
+  /* Without the object lock: tearing down and unparenting take the buffer's
+   * lock, and a buffer takes this object's lock while holding its own. It is
+   * out of the list already, so it counts as removed meanwhile. */
+  if (gst_source_buffer_get_updating (buffer))
+    gst_source_buffer_teardown (buffer);
+  gst_object_unparent (GST_OBJECT (buffer));
+  gst_object_unref (buffer);
 
   return TRUE;
 
