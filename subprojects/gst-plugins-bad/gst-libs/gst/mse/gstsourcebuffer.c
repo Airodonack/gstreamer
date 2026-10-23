@@ -150,6 +150,9 @@ struct _GstSourceBuffer
   gboolean generate_timestamps;
   GstClockTime timestamp_offset;
   gboolean updating;
+  /* Bumped by abort so an append task that was waiting on the pipeline
+   * knows its append was dropped. */
+  guint append_generation;
   gboolean errored;
   gsize size_limit;
   gsize size;
@@ -157,6 +160,10 @@ struct _GstSourceBuffer
   GCond pending_data_cond;
   AppendToBufferTask *append_to_buffer_task;
   GstAppendPipeline *append_pipeline;
+  /* Serializes the parser resets, which run without the object lock: the
+   * append task's error path and an abort() at the same time would each
+   * free the append pipeline's tracks under the other. */
+  GMutex reset_lock;
   GstMseEventQueue *event_queue;
 
   GMutex tracks_lock;
@@ -214,7 +221,6 @@ static void call_active_state_changed (GstSourceBuffer * self);
 
 static GArray *get_buffered_unlocked (GstSourceBuffer * self);
 static inline gboolean is_removed_unlocked (GstSourceBuffer * self);
-static void reset_parser_state_unlocked (GstSourceBuffer * self);
 static void append_error_unlocked (GstSourceBuffer * self);
 
 static void seek_track_buffer_unlocked (GstMediaSourceTrack * track,
@@ -402,6 +408,7 @@ gst_source_buffer_finalize (GObject * object)
   g_hash_table_unref (self->track_buffers);
   g_hash_table_unref (self->track_feeds);
   g_mutex_clear (&self->tracks_lock);
+  g_mutex_clear (&self->reset_lock);
 
   G_OBJECT_CLASS (gst_source_buffer_parent_class)->finalize (object);
 }
@@ -900,6 +907,10 @@ on_received_init_segment (GstAppendPipeline * pipeline, gpointer user_data)
     g_ptr_array_foreach (audio_tracks, (GFunc) add_track_buffer_unlocked, self);
     g_ptr_array_foreach (text_tracks, (GFunc) add_track_buffer_unlocked, self);
     g_ptr_array_foreach (video_tracks, (GFunc) add_track_buffer_unlocked, self);
+
+    g_ptr_array_unref (audio_tracks);
+    g_ptr_array_unref (text_tracks);
+    g_ptr_array_unref (video_tracks);
   }
 
   update_track_buffer_modes (self);
@@ -946,6 +957,7 @@ gst_source_buffer_init (GstSourceBuffer * self)
   self->track_buffers = g_hash_table_new_full ((GHashFunc) track_buffer_hash,
       (GEqualFunc) track_buffer_equal, NULL, gst_object_unref);
   g_mutex_init (&self->tracks_lock);
+  g_mutex_init (&self->reset_lock);
 
   self->track_feeds = g_hash_table_new_full (g_direct_hash, g_direct_equal,
       NULL, (GDestroyNotify) clear_track_feed);
@@ -1640,30 +1652,46 @@ evict_coded_frames_unlocked (GstSourceBuffer * self, gsize space_required,
       self->size * 100 / size_limit);
 }
 
+/* Reset parser state, for the append task, abort and teardown: called
+ * without the object lock, since stopping the append pipeline joins its
+ * threads, which may need that lock to deliver a sample. The reset lock
+ * keeps two of them (the append task's error path and an abort() from the
+ * application) from resetting the same pipeline at once. */
 static void
-reset_parser_state_unlocked (GstSourceBuffer * self)
+reset_parser_state (GstSourceBuffer * self)
 {
-  clear_pending_data_unlocked (self);
-  if (gst_append_pipeline_reset (self->append_pipeline)) {
+  g_mutex_lock (&self->reset_lock);
+  gboolean reset = gst_append_pipeline_reset (self->append_pipeline);
+  g_mutex_unlock (&self->reset_lock);
+  GST_OBJECT_LOCK (self);
+  if (reset) {
     clear_errored (self);
   } else {
     set_errored (self);
   }
+  GST_OBJECT_UNLOCK (self);
 }
 
+/* Append error algorithm, for the append task: called and returns with the
+ * object lock held, but resets the parser without it. */
 static void
 append_error_unlocked (GstSourceBuffer * self)
 {
-  reset_parser_state_unlocked (self);
+  self->append_generation++;
+  clear_pending_data_unlocked (self);
   clear_updating (self);
+  if (!is_removed_unlocked (self)) {
+    schedule_event_unlocked (self, ON_ERROR);
+    schedule_event_unlocked (self, ON_UPDATE_END);
+  }
+
+  GST_OBJECT_UNLOCK (self);
+  reset_parser_state (self);
+  GST_OBJECT_LOCK (self);
 
   if (is_removed_unlocked (self)) {
     return;
   }
-
-  schedule_event_unlocked (self, ON_ERROR);
-  schedule_event_unlocked (self, ON_UPDATE_END);
-
   GstMediaSource *source = get_media_source_unlocked (self);
   gst_media_source_end_of_stream (source, GST_MEDIA_SOURCE_EOS_ERROR_DECODE,
       NULL);
@@ -1779,9 +1807,15 @@ append_to_buffer_task_func (AppendToBufferTask * task)
    * through on_new_sample(), which takes the object lock, so wait for them
    * without it. Only once they are in the track buffers does the buffered
    * attribute reflect this append, which is what update-end promises. */
+  guint generation = self->append_generation;
   GST_OBJECT_UNLOCK (self);
   gst_append_pipeline_wait_for_appends (self->append_pipeline);
   GST_OBJECT_LOCK (self);
+
+  if (generation != self->append_generation) {
+    GST_DEBUG_OBJECT (self, "append was aborted");
+    goto done;
+  }
 
   if (is_removed_unlocked (self)) {
     append_successful_unlocked (self, TRUE);
@@ -2185,18 +2219,26 @@ gst_source_buffer_get_duration (GstSourceBuffer * self)
 void
 gst_source_buffer_teardown (GstSourceBuffer * self)
 {
+  /* As in abort: the append in flight is dropped under the object lock, and
+   * the parser is reset without it, since stopping the append pipeline joins
+   * its task, which may need that lock to deliver a sample. */
   GST_OBJECT_LOCK (self);
-  reset_parser_state_unlocked (self);
+  self->append_generation++;
+  clear_pending_data_unlocked (self);
   clear_updating (self);
   GST_OBJECT_UNLOCK (self);
+  reset_parser_state (self);
 }
 
+/* The array holds a reference to each track: the caller is the media
+ * source on another buffer's streaming thread, and this buffer's abort()
+ * may be dropping the pipeline's references meanwhile. */
 GPtrArray *
 gst_source_buffer_get_all_tracks (GstSourceBuffer * self)
 {
   g_return_val_if_fail (GST_IS_SOURCE_BUFFER (self), NULL);
 
-  GPtrArray *tracks = g_ptr_array_new ();
+  GPtrArray *tracks = g_ptr_array_new_with_free_func (gst_object_unref);
 
   GPtrArray *audio_tracks = gst_append_pipeline_get_audio_tracks
       (self->append_pipeline);
@@ -2206,13 +2248,19 @@ gst_source_buffer_get_all_tracks (GstSourceBuffer * self)
       (self->append_pipeline);
 
   if (audio_tracks) {
-    g_ptr_array_extend (tracks, audio_tracks, NULL, NULL);
+    g_ptr_array_extend (tracks, audio_tracks, (GCopyFunc) gst_object_ref,
+        NULL);
+    g_ptr_array_unref (audio_tracks);
   }
   if (text_tracks) {
-    g_ptr_array_extend (tracks, text_tracks, NULL, NULL);
+    g_ptr_array_extend (tracks, text_tracks, (GCopyFunc) gst_object_ref,
+        NULL);
+    g_ptr_array_unref (text_tracks);
   }
   if (video_tracks) {
-    g_ptr_array_extend (tracks, video_tracks, NULL, NULL);
+    g_ptr_array_extend (tracks, video_tracks, (GCopyFunc) gst_object_ref,
+        NULL);
+    g_ptr_array_unref (video_tracks);
   }
 
   return tracks;
