@@ -98,7 +98,29 @@ struct _GstAppendPipeline
   BackgroundTask *task;
 
   Callbacks callbacks;
+
+  /* Appends pushed into the pipeline whose end-of-append the background
+   * task has not consumed yet; waited on by
+   * gst_append_pipeline_wait_for_appends(). */
+  GMutex appends_lock;
+  GCond appends_cond;
+  guint appends_in_flight;
+  gboolean appends_abandoned;
 };
+
+static void
+appends_done (GstAppendPipeline * self, gboolean abandoned)
+{
+  g_mutex_lock (&self->appends_lock);
+  if (abandoned) {
+    self->appends_abandoned = TRUE;
+    self->appends_in_flight = 0;
+  } else if (self->appends_in_flight > 0) {
+    self->appends_in_flight--;
+  }
+  g_cond_broadcast (&self->appends_cond);
+  g_mutex_unlock (&self->appends_lock);
+}
 
 G_DEFINE_TYPE (GstAppendPipeline, gst_append_pipeline, GST_TYPE_OBJECT);
 
@@ -307,6 +329,7 @@ handle_shutdown (BackgroundTask * task)
 {
   gst_task_stop (task->task);
   GstAppendPipeline *self = task->pipeline;
+  appends_done (self, TRUE);
   guint track_count = n_tracks (self);
   for (guint i = 0; i < track_count; i++) {
     Track *track = index_track (self, i);
@@ -319,6 +342,7 @@ static void
 handle_abort (BackgroundTask * task)
 {
   gst_task_stop (task->task);
+  appends_done (task->pipeline, TRUE);
 }
 
 static void
@@ -332,6 +356,7 @@ task_function (gpointer user_data)
       if (gst_message_has_name (message, END_OF_APPEND)) {
         GST_TRACE_OBJECT (self, "end of append");
         consume_all_samples (self);
+        appends_done (self, FALSE);
         goto done;
       }
       if (gst_message_has_name (message, SHUTDOWN)) {
@@ -742,6 +767,11 @@ gst_append_pipeline_init (GstAppendPipeline * self)
   self->encountered_error = FALSE;
   self->tracks = new_tracks_array ();
   init_segment_init (&self->init_segment);
+
+  g_mutex_init (&self->appends_lock);
+  g_cond_init (&self->appends_cond);
+  self->appends_in_flight = 0;
+  self->appends_abandoned = FALSE;
 }
 
 static void
@@ -769,6 +799,9 @@ gst_append_pipeline_finalize (GObject * object)
 
   g_array_free (self->tracks, TRUE);
   gst_clear_object (&self->streams);
+
+  g_mutex_clear (&self->appends_lock);
+  g_cond_clear (&self->appends_cond);
 
   G_OBJECT_CLASS (gst_append_pipeline_parent_class)->finalize (object);
 }
@@ -823,12 +856,32 @@ gst_append_pipeline_append (GstAppendPipeline * self, GstBuffer * buffer)
   if (push_result != GST_FLOW_OK)
     return push_result;
 
+  g_mutex_lock (&self->appends_lock);
+  self->appends_in_flight++;
+  g_mutex_unlock (&self->appends_lock);
+
   if (!gst_element_send_event (GST_ELEMENT_CAST (self->src),
           new_end_of_append_event ())) {
     GST_ERROR_OBJECT (self, "failed to push end-of-append event");
+    appends_done (self, FALSE);
     return GST_FLOW_ERROR;
   }
   return GST_FLOW_OK;
+}
+
+/* Blocks until every buffer given to gst_append_pipeline_append() has been
+ * parsed and its samples handed to the new_sample callback, or until the
+ * pipeline shut down, failed or was aborted. Must be called without any lock
+ * the new_sample callback takes, or the callback would deadlock against it. */
+void
+gst_append_pipeline_wait_for_appends (GstAppendPipeline * self)
+{
+  g_return_if_fail (GST_IS_APPEND_PIPELINE (self));
+  g_mutex_lock (&self->appends_lock);
+  while (self->appends_in_flight > 0 && !self->appends_abandoned) {
+    g_cond_wait (&self->appends_cond, &self->appends_lock);
+  }
+  g_mutex_unlock (&self->appends_lock);
 }
 
 GstFlowReturn
@@ -854,6 +907,7 @@ gst_append_pipeline_stop (GstAppendPipeline * self)
   }
   self->received_init_segment = FALSE;
   self->encountered_error = FALSE;
+  appends_done (self, TRUE);
 
   return TRUE;
 }
@@ -903,6 +957,12 @@ gst_append_pipeline_reset (GstAppendPipeline * self)
   self->encountered_error = FALSE;
   self->tracks = new_tracks_array ();
   init_segment_init (&self->init_segment);
+
+  g_mutex_lock (&self->appends_lock);
+  self->appends_in_flight = 0;
+  self->appends_abandoned = FALSE;
+  g_cond_broadcast (&self->appends_cond);
+  g_mutex_unlock (&self->appends_lock);
 
   if (!background_task_start (self->task)) {
     GST_ERROR_OBJECT (self, "failed to start background task");

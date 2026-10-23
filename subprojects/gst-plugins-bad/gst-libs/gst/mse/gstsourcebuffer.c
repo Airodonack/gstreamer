@@ -1775,6 +1775,24 @@ append_to_buffer_task_func (AppendToBufferTask * task)
     goto done;
   }
 
+  /* The append pipeline parses on its own thread and delivers the samples
+   * through on_new_sample(), which takes the object lock, so wait for them
+   * without it. Only once they are in the track buffers does the buffered
+   * attribute reflect this append, which is what update-end promises. */
+  GST_OBJECT_UNLOCK (self);
+  gst_append_pipeline_wait_for_appends (self->append_pipeline);
+  GST_OBJECT_LOCK (self);
+
+  if (is_removed_unlocked (self)) {
+    append_successful_unlocked (self, TRUE);
+    goto done;
+  }
+
+  if (encountered_bad_bytes_unlocked (self)) {
+    append_error_unlocked (self);
+    goto done;
+  }
+
   append_successful_unlocked (self, is_ended_unlocked (self));
 
 done:

@@ -139,6 +139,87 @@ test_mp4_buffer (void)
   return test_file_buffer ("mse.mp4");
 }
 
+/* Counts the update-end, error and abort events a source buffer emits, on
+ * its event thread, so that a test can wait for them. */
+typedef struct
+{
+  GMutex mutex;
+  GCond cond;
+  guint update_end;
+  guint error;
+  guint abort;
+} SourceBufferEvents;
+
+static void
+count_update_end (GstSourceBuffer * source_buffer, SourceBufferEvents * events)
+{
+  g_mutex_lock (&events->mutex);
+  events->update_end++;
+  g_cond_broadcast (&events->cond);
+  g_mutex_unlock (&events->mutex);
+}
+
+static void
+count_error (GstSourceBuffer * source_buffer, SourceBufferEvents * events)
+{
+  g_mutex_lock (&events->mutex);
+  events->error++;
+  g_cond_broadcast (&events->cond);
+  g_mutex_unlock (&events->mutex);
+}
+
+static void
+count_abort (GstSourceBuffer * source_buffer, SourceBufferEvents * events)
+{
+  g_mutex_lock (&events->mutex);
+  events->abort++;
+  g_cond_broadcast (&events->cond);
+  g_mutex_unlock (&events->mutex);
+}
+
+static void
+source_buffer_events_init (SourceBufferEvents * events,
+    GstSourceBuffer * source_buffer)
+{
+  g_mutex_init (&events->mutex);
+  g_cond_init (&events->cond);
+  events->update_end = 0;
+  events->error = 0;
+  events->abort = 0;
+  g_signal_connect (source_buffer, "on-update-end",
+      G_CALLBACK (count_update_end), events);
+  g_signal_connect (source_buffer, "on-error", G_CALLBACK (count_error),
+      events);
+  g_signal_connect (source_buffer, "on-abort", G_CALLBACK (count_abort),
+      events);
+}
+
+static void
+source_buffer_events_clear (SourceBufferEvents * events,
+    GstSourceBuffer * source_buffer)
+{
+  g_signal_handlers_disconnect_by_data (source_buffer, events);
+  g_mutex_clear (&events->mutex);
+  g_cond_clear (&events->cond);
+}
+
+/* Waits until the source buffer has emitted update-end count times. */
+static void
+await_update_end (SourceBufferEvents * events, guint count)
+{
+  gint64 deadline = g_get_monotonic_time () + EVENT_TIMEOUT;
+  g_mutex_lock (&events->mutex);
+  while (events->update_end < count) {
+    if (!g_cond_wait_until (&events->cond, &events->mutex, deadline)) {
+      guint have = events->update_end;
+      g_mutex_unlock (&events->mutex);
+      ck_abort_msg ("timed out waiting for update-end %u, have %u", count,
+          have);
+    }
+  }
+  g_mutex_unlock (&events->mutex);
+}
+
 /* An open media source with one MP4 source buffer, the usual fixture for
  * the source buffer tests. */
 static GstSourceBuffer *
@@ -149,6 +230,46 @@ mp4_source_buffer (GstMediaSource ** media_source)
       gst_media_source_add_source_buffer (*media_source, "video/mp4", NULL);
   fail_unless (GST_IS_SOURCE_BUFFER (source_buffer));
   return source_buffer;
+}
+
+/* Releases the fixture of mp4_source_buffer() once media was appended.
+ * Each track feed holds a reference to the source buffer while it runs
+ * and drops it on its own thread, which must not be the one finalizing
+ * the buffer: it still holds the feed's task lock, which finalization
+ * frees. So the stream is ended, which lets the feeds push EOS and stop,
+ * and the fixture's references go only once theirs are gone. */
+static void
+finish_mp4_source_buffer (GstMediaSource * media_source,
+    GstSourceBuffer * source_buffer)
+{
+  GError *error = NULL;
+  fail_unless (gst_media_source_end_of_stream (media_source,
+          GST_MEDIA_SOURCE_EOS_ERROR_NONE, &error));
+  g_assert_no_error (error);
+
+  /* The parent, the buffer lists and this test. */
+  GstSourceBufferList *active_buffers =
+      gst_media_source_get_active_source_buffers (media_source);
+  guint fixture_refs = 3;
+  for (guint i = 0; i < gst_source_buffer_list_get_length (active_buffers);
+      i++) {
+    GstSourceBuffer *active = gst_source_buffer_list_index (active_buffers, i);
+    if (active == source_buffer) {
+      fixture_refs++;
+    }
+    gst_object_unref (active);
+  }
+  gst_object_unref (active_buffers);
+  gint64 deadline = g_get_monotonic_time () + EVENT_TIMEOUT;
+  while (GST_OBJECT_REFCOUNT_VALUE (source_buffer) > fixture_refs
+      && g_get_monotonic_time () < deadline) {
+    g_usleep (G_TIME_SPAN_MILLISECOND);
+  }
+  fail_unless_equals_int (GST_OBJECT_REFCOUNT_VALUE (source_buffer),
+      fixture_refs);
+
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
 }
 
 GST_START_TEST (test_create_and_free)
@@ -897,6 +1018,36 @@ source_buffer_disposed (RemoveInHandlerContext * context,
   g_mutex_unlock (&context->mutex);
 }
 
+GST_START_TEST (test_source_buffer_buffered_at_update_end)
+{
+  /* Proves that when update-end fires for an append, the media it carried
+   * is already in the buffered ranges. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+  fail_if (gst_source_buffer_get_updating (source_buffer));
+
+  GArray *buffered = gst_source_buffer_get_buffered (source_buffer, &error);
+  g_assert_no_error (error);
+  fail_unless_equals_int (buffered->len, 1);
+  GstMediaSourceRange range = g_array_index (buffered, GstMediaSourceRange, 0);
+  fail_unless (range.start < GST_SECOND);
+  fail_unless (range.end > range.start);
+  g_array_unref (buffered);
+
+  source_buffer_events_clear (&events, source_buffer);
+  finish_mp4_source_buffer (media_source, source_buffer);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_source_buffer_removed_in_event_handler)
 {
   /* Proves a source buffer can be removed, and lose its last reference,
@@ -1356,6 +1507,8 @@ mse_suite (void)
   if (have_qtdemux) {
     tcase_add_test (tc_source_buffer,
         test_source_buffer_removed_in_event_handler);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_buffered_at_update_end);
   }
 
   tcase_add_test (tc_append_pipeline, test_append_pipeline_create_and_free);
