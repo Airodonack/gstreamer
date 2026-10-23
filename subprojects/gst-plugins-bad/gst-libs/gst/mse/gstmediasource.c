@@ -105,7 +105,7 @@ static guint signals[N_SIGNALS];
 #define DEFAULT_POSITION    GST_CLOCK_TIME_NONE
 #define DEFAULT_DURATION    GST_CLOCK_TIME_NONE
 
-static void rebuild_active_source_buffers_unlocked (GstMediaSource * self);
+static void rebuild_active_source_buffers (GstMediaSource * self);
 static void detach_unlocked (GstMediaSource * self);
 static void set_duration_unlocked (GstMediaSource * self,
     GstClockTime duration);
@@ -778,45 +778,85 @@ source_buffer_list_as_set (GstSourceBufferList * list)
   return buffers;
 }
 
+/* Must be called without the object lock: gst_source_buffer_get_active() takes
+ * the source buffer's tracks lock, and a source buffer takes this object's
+ * lock while holding its own (an append checks the ready state), so asking
+ * the buffers under the object lock can deadlock against an append. The
+ * states are read first and committed under the lock; when another rebuild
+ * started meanwhile (two buffers' init segments at once), its snapshot may be
+ * newer, so this one starts over. */
 static void
-rebuild_active_source_buffers_unlocked (GstMediaSource * self)
+rebuild_active_source_buffers (GstMediaSource * self)
 {
-  GST_DEBUG_OBJECT (self, "rebuilding active source buffers");
-  GHashTable *previously_active =
-      source_buffer_list_as_set (self->active_buffers);
+  while (TRUE) {
+    GST_OBJECT_LOCK (self);
+    guint generation = ++self->active_buffers_generation;
+    GST_OBJECT_UNLOCK (self);
 
-  gst_source_buffer_list_notify_freeze (self->active_buffers);
-  gst_source_buffer_list_remove_all (self->active_buffers);
-
-  gboolean added = FALSE;
-  gboolean removed = FALSE;
-
-  for (guint i = 0;; i++) {
-    GstSourceBuffer *buf = gst_source_buffer_list_index (self->buffers, i);
-    if (buf == NULL) {
-      break;
+    GPtrArray *buffers = g_ptr_array_new_with_free_func (gst_object_unref);
+    GArray *active = g_array_new (FALSE, FALSE, sizeof (gboolean));
+    for (guint i = 0;; i++) {
+      GstSourceBuffer *buf = gst_source_buffer_list_index (self->buffers, i);
+      if (buf == NULL) {
+        break;
+      }
+      gboolean buf_active = gst_source_buffer_get_active (buf);
+      g_ptr_array_add (buffers, buf);
+      g_array_append_val (active, buf_active);
     }
-    if (gst_source_buffer_get_active (buf)) {
-      gst_source_buffer_list_append (self->active_buffers, buf);
-      added |= !g_hash_table_contains (previously_active, buf);
-    } else {
-      gst_source_buffer_list_append (self->active_buffers, buf);
-      removed |= g_hash_table_contains (previously_active, buf);
+
+    GST_OBJECT_LOCK (self);
+
+    if (generation != self->active_buffers_generation) {
+      GST_OBJECT_UNLOCK (self);
+      g_ptr_array_unref (buffers);
+      g_array_unref (active);
+      continue;
     }
-    gst_object_unref (buf);
-  }
-  g_hash_table_unref (previously_active);
 
-  gst_source_buffer_list_notify_cancel (self->active_buffers);
-  gst_source_buffer_list_notify_thaw (self->active_buffers);
+    GST_DEBUG_OBJECT (self, "rebuilding active source buffers");
+    GHashTable *previously_active =
+        source_buffer_list_as_set (self->active_buffers);
 
-  if (added) {
-    GST_DEBUG_OBJECT (self, "notifying active source buffer added");
-    gst_source_buffer_list_notify_added (self->active_buffers);
-  }
-  if (removed) {
-    GST_DEBUG_OBJECT (self, "notifying active source buffer removed");
-    gst_source_buffer_list_notify_removed (self->active_buffers);
+    gst_source_buffer_list_notify_freeze (self->active_buffers);
+    gst_source_buffer_list_remove_all (self->active_buffers);
+
+    gboolean added = FALSE;
+    gboolean removed = FALSE;
+
+    for (guint i = 0; i < buffers->len; i++) {
+      GstSourceBuffer *buf = g_ptr_array_index (buffers, i);
+      /* Removed since the snapshot. */
+      if (!gst_source_buffer_list_contains (self->buffers, buf)) {
+        removed |= g_hash_table_contains (previously_active, buf);
+        continue;
+      }
+      if (g_array_index (active, gboolean, i)) {
+        gst_source_buffer_list_append (self->active_buffers, buf);
+        added |= !g_hash_table_contains (previously_active, buf);
+      } else {
+        gst_source_buffer_list_append (self->active_buffers, buf);
+        removed |= g_hash_table_contains (previously_active, buf);
+      }
+    }
+    g_hash_table_unref (previously_active);
+    g_ptr_array_unref (buffers);
+    g_array_unref (active);
+
+    gst_source_buffer_list_notify_cancel (self->active_buffers);
+    gst_source_buffer_list_notify_thaw (self->active_buffers);
+
+    if (added) {
+      GST_DEBUG_OBJECT (self, "notifying active source buffer added");
+      gst_source_buffer_list_notify_added (self->active_buffers);
+    }
+    if (removed) {
+      GST_DEBUG_OBJECT (self, "notifying active source buffer removed");
+      gst_source_buffer_list_notify_removed (self->active_buffers);
+    }
+
+    GST_OBJECT_UNLOCK (self);
+    return;
   }
 }
 
@@ -825,9 +865,7 @@ on_active_state_changed (GstSourceBuffer * source_buffer, gpointer user_data)
 {
   GstMediaSource *self = GST_MEDIA_SOURCE (user_data);
 
-  GST_OBJECT_LOCK (self);
-  rebuild_active_source_buffers_unlocked (self);
-  GST_OBJECT_UNLOCK (self);
+  rebuild_active_source_buffers (self);
 }
 
 /**
@@ -1146,15 +1184,15 @@ gst_media_source_seek (GstMediaSource * self, GstClockTime time)
 {
   g_return_if_fail (GST_IS_MEDIA_SOURCE (self));
 
-  GST_OBJECT_LOCK (self);
+  /* Not under the object lock: gst_source_buffer_seek() takes the source
+   * buffer's tracks lock, and a source buffer takes this object's lock while
+   * holding its own. The list has a lock of its own. */
   for (guint i = 0;; i++) {
     GstSourceBuffer *buf = gst_source_buffer_list_index (self->buffers, i);
     if (buf == NULL) {
-      goto done;
+      return;
     }
     gst_source_buffer_seek (buf, time);
     gst_object_unref (buf);
   }
-done:
-  GST_OBJECT_UNLOCK (self);
 }
