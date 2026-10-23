@@ -1796,8 +1796,10 @@ append_to_buffer_task_func (AppendToBufferTask * task)
   }
 
   if (!GST_IS_BUFFER (pending_data)) {
+    /* The wait timed out with nothing appended: there is no append to
+     * report. Signalling update and update-end here would tell the
+     * application that an append it makes right afterwards has completed. */
     GST_TRACE_OBJECT (self, "no pending data");
-    append_successful_unlocked (self, is_ended_unlocked (self));
     goto done;
   }
 
