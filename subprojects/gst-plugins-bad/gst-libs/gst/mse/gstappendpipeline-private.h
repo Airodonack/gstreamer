@@ -64,6 +64,9 @@ GstFlowReturn gst_append_pipeline_append (GstAppendPipeline * self,
     GstBuffer * buffer);
 
 GST_MSE_PRIVATE
+void gst_append_pipeline_set_caps (GstAppendPipeline * self, GstCaps * caps);
+
+GST_MSE_PRIVATE
 void gst_append_pipeline_wait_for_appends (GstAppendPipeline * self);
 
 GST_MSE_PRIVATE
