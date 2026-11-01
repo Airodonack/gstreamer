@@ -72,4 +72,7 @@ gboolean gst_source_buffer_get_active (GstSourceBuffer * self);
 GST_MSE_PRIVATE
 void gst_source_buffer_mark_eos (GstSourceBuffer * self);
 
+GST_MSE_PRIVATE
+void gst_source_buffer_clear_eos (GstSourceBuffer * self);
+
 G_END_DECLS
