@@ -155,7 +155,7 @@ struct _GstSourceBuffer
   GstClockTime append_window_end;
   gchar *content_type;
   gboolean generate_timestamps;
-  GstClockTime timestamp_offset;
+  GstClockTimeDiff timestamp_offset;
   gboolean updating;
   /* Bumped by abort so an append task that was waiting on the pipeline
    * knows its append was dropped. */
@@ -596,7 +596,8 @@ gst_source_buffer_class_init (GstSourceBufferClass * klass)
    * GstSourceBuffer:timestamp-offset:
    *
    * The next media segment appended to the current Source Buffer will have its
-   * start timestamp increased by this amount.
+   * start timestamp increased by this amount. A negative offset moves it
+   * earlier.
    *
    * [Specification](https://www.w3.org/TR/media-source-2/#dom-sourcebuffer-timestampoffset)
    *
@@ -606,7 +607,7 @@ gst_source_buffer_class_init (GstSourceBufferClass * klass)
       "Timestamp Offset",
       "The next media segment appended to the current Source Buffer"
       " will have its start timestamp increased by this amount",
-      0, G_MAXINT64, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
+      G_MININT64, G_MAXINT64, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
 
   /**
    * GstSourceBuffer:updating:
@@ -1606,16 +1607,17 @@ error:
  *
  * [Specification](https://www.w3.org/TR/media-source-2/#dom-sourcebuffer-timestampoffset)
  *
- * Returns: The current timestamp offset as a #GstClockTime
+ * Returns: The current timestamp offset as a #GstClockTimeDiff, which may
+ * be negative
  * Since: 1.24
  */
-GstClockTime
+GstClockTimeDiff
 gst_source_buffer_get_timestamp_offset (GstSourceBuffer * self)
 {
-  g_return_val_if_fail (GST_IS_SOURCE_BUFFER (self), FALSE);
+  g_return_val_if_fail (GST_IS_SOURCE_BUFFER (self), 0);
 
   GST_OBJECT_LOCK (self);
-  GstClockTime timestamp_offset = self->timestamp_offset;
+  GstClockTimeDiff timestamp_offset = self->timestamp_offset;
   GST_OBJECT_UNLOCK (self);
 
   return timestamp_offset;
@@ -1624,11 +1626,12 @@ gst_source_buffer_get_timestamp_offset (GstSourceBuffer * self)
 /**
  * gst_source_buffer_set_timestamp_offset:
  * @self: #GstSourceBuffer instance
- * @offset: The new timestamp offset
+ * @offset: The new timestamp offset, which may be negative
  * @error: (out) (optional) (nullable) (transfer full): the resulting error or `NULL`
  *
  * Attempt to set the timestamp offset of @self. Any media processed after this
- * value is set will have this value added to its start time.
+ * value is set will have this value added to its start time. Media that a
+ * negative offset would move before zero is dropped.
  *
  * [Specification](https://www.w3.org/TR/media-source-2/#dom-sourcebuffer-timestampoffset)
  *
@@ -1636,8 +1639,8 @@ gst_source_buffer_get_timestamp_offset (GstSourceBuffer * self)
  * Since: 1.24
  */
 gboolean
-gst_source_buffer_set_timestamp_offset (GstSourceBuffer * self, GstClockTime
-    offset, GError ** error)
+gst_source_buffer_set_timestamp_offset (GstSourceBuffer * self,
+    GstClockTimeDiff offset, GError ** error)
 {
   g_return_val_if_fail (GST_IS_SOURCE_BUFFER (self), FALSE);
 
