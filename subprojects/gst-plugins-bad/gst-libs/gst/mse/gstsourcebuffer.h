@@ -86,11 +86,12 @@ GArray * gst_source_buffer_get_buffered (GstSourceBuffer * self,
 
 GST_MSE_API
 gboolean gst_source_buffer_set_timestamp_offset (GstSourceBuffer * self,
-                                                 GstClockTime offset,
+                                                 GstClockTimeDiff offset,
                                                  GError ** error);
 
 GST_MSE_API
-GstClockTime gst_source_buffer_get_timestamp_offset (GstSourceBuffer * self);
+GstClockTimeDiff gst_source_buffer_get_timestamp_offset (
+    GstSourceBuffer * self);
 
 GST_MSE_API
 gboolean gst_source_buffer_set_append_window_start (GstSourceBuffer * self,
