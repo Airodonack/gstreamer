@@ -48,6 +48,10 @@ gboolean gst_media_source_media_type_is_supported (
     GstMediaSourceMediaType * self);
 
 GST_MSE_PRIVATE
+GstCaps * gst_media_source_media_type_get_caps (
+    GstMediaSourceMediaType * self);
+
+GST_MSE_PRIVATE
 gboolean gst_media_source_media_type_generates_timestamp (
     GstMediaSourceMediaType * self);
 
