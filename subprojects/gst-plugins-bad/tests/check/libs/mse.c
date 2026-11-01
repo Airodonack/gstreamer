@@ -1221,6 +1221,29 @@ GST_START_TEST (test_source_buffer_negative_timestamp_offset_sequence)
 
 GST_END_TEST;
 
+GST_START_TEST (test_source_buffer_timestamp_offset_segments)
+{
+  /* Proves the timestamp offset moves the media in segments mode too,
+   * later or earlier, dropping what would land before zero: coded frame
+   * processing adds it to every frame's timestamps whatever the mode. */
+  GstMediaSourceRange plain =
+      buffered_with_offset (GST_SOURCE_BUFFER_APPEND_MODE_SEGMENTS, 0);
+  GstMediaSourceRange later =
+      buffered_with_offset (GST_SOURCE_BUFFER_APPEND_MODE_SEGMENTS,
+      2 * GST_SECOND);
+  GstMediaSourceRange earlier =
+      buffered_with_offset (GST_SOURCE_BUFFER_APPEND_MODE_SEGMENTS,
+      -GST_SECOND);
+
+  fail_unless_equals_uint64 (later.start, plain.start + 2 * GST_SECOND);
+  fail_unless_equals_uint64 (later.end, plain.end + 2 * GST_SECOND);
+  fail_unless (earlier.start < 100 * GST_MSECOND,
+      "buffered from %" GST_TIMEP_FORMAT, &earlier.start);
+  fail_unless_equals_uint64 (earlier.end, plain.end - GST_SECOND);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_source_buffer_append_after_abort)
 {
   /* Proves an append after abort(), which starts over with an
@@ -2259,6 +2282,8 @@ mse_suite (void)
     tcase_add_test (tc_source_buffer, test_source_buffer_append_after_abort);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_negative_timestamp_offset_sequence);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_timestamp_offset_segments);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_parse_error_reported_once);
     tcase_add_test (tc_source_buffer, test_source_buffer_remove_range);
