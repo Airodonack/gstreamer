@@ -2041,8 +2041,10 @@ track_feed_task (TrackFeedTask * feed)
   GValue start_dts_value = G_VALUE_INIT;
   g_value_init (&start_dts_value, G_TYPE_UINT64);
   g_value_set_uint64 (&start_dts_value, time);
+  guint pushed_eos_count = 0;
   while (TRUE) {
     gboolean eos = gst_media_source_track_buffer_is_eos (buffer);
+    guint eos_count = gst_media_source_track_buffer_get_eos_count (buffer);
     GstIterator *it = gst_media_source_track_buffer_iter_samples (buffer);
     it = gst_iterator_filter (it, (GCompareFunc) clip_to_seek_time_dts,
         &start_dts_value);
@@ -2055,13 +2057,15 @@ track_feed_task (TrackFeedTask * feed)
       break;
     }
 
-    if (eos) {
+    /* The feed keeps running after its EOS: a source that reopens clears the
+     * track buffer's EOS, and media appended then follows the EOS on the
+     * track, from where the feed left off, until the next EOS. */
+    if (eos && eos_count != pushed_eos_count) {
       GST_DEBUG_OBJECT (self, "%s: enqueued all %u samples", track_id,
           g_hash_table_size (acc.processed_samples));
       gst_media_source_track_push_eos (track);
       GST_DEBUG_OBJECT (self, "%s: marked EOS", track_id);
-      gst_task_stop (feed->task);
-      break;
+      pushed_eos_count = eos_count;
     }
 
     if (g_atomic_int_get (&feed->cancelled)) {
@@ -2129,25 +2133,28 @@ gst_source_buffer_append_buffer (GstSourceBuffer * self, GstBuffer * buf,
   g_return_val_if_fail (GST_IS_BUFFER (buf), FALSE);
 
   GST_OBJECT_LOCK (self);
-  TRACKS_LOCK (self);
 
   if (is_removed_unlocked (self) || is_updating (self)) {
     g_set_error (error,
         GST_MEDIA_SOURCE_ERROR, GST_MEDIA_SOURCE_ERROR_INVALID_STATE,
         "source buffer is removed or still updating");
-    goto error;
+    goto error_without_tracks_lock;
   }
 
   if (is_errored (self)) {
     g_set_error (error,
         GST_MEDIA_SOURCE_ERROR, GST_MEDIA_SOURCE_ERROR_INVALID_STATE,
         "source buffer has encountered error");
-    goto error;
+    goto error_without_tracks_lock;
   }
 
+  /* Reopening clears the EOS of every source buffer's tracks, this one's
+   * too, so it comes before this buffer's tracks lock is taken. */
   if (is_ended_unlocked (self)) {
     open_parent_unlocked (self);
   }
+
+  TRACKS_LOCK (self);
 
   GstMediaSource *source = get_media_source_unlocked (self);
   gsize buffer_size = gst_buffer_get_size (buf);
@@ -2180,6 +2187,7 @@ gst_source_buffer_append_buffer (GstSourceBuffer * self, GstBuffer * buf,
 
 error:
   TRACKS_UNLOCK (self);
+error_without_tracks_lock:
   GST_OBJECT_UNLOCK (self);
   gst_clear_buffer (&buf);
   return FALSE;
@@ -2473,6 +2481,25 @@ gst_source_buffer_mark_eos (GstSourceBuffer * self)
   g_hash_table_iter_init (&iter, self->track_buffers);
   while (g_hash_table_iter_next (&iter, NULL, &value)) {
     gst_media_source_track_buffer_eos (GST_MEDIA_SOURCE_TRACK_BUFFER (value));
+  }
+  TRACKS_UNLOCK (self);
+}
+
+/* The parent source reopened after its end of stream (MSE, prepare append
+ * step 5, and the other setters that reopen an ended source): the track
+ * buffers may get more media, which the track feeds push after their EOS. */
+void
+gst_source_buffer_clear_eos (GstSourceBuffer * self)
+{
+  g_return_if_fail (GST_IS_SOURCE_BUFFER (self));
+
+  TRACKS_LOCK (self);
+  GHashTableIter iter;
+  gpointer value;
+  g_hash_table_iter_init (&iter, self->track_buffers);
+  while (g_hash_table_iter_next (&iter, NULL, &value)) {
+    gst_media_source_track_buffer_clear_eos (GST_MEDIA_SOURCE_TRACK_BUFFER
+        (value));
   }
   TRACKS_UNLOCK (self);
 }
