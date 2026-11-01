@@ -804,6 +804,24 @@ be negative</doc>
           </instance-parameter>
         </parameters>
       </method>
+      <method name="get_tracks" c:identifier="gst_source_buffer_get_tracks" glib:get-property="tracks" version="1.30">
+        <doc xml:space="preserve" filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c">Returns the tracks of the initialization segment @self processed most
+recently, as described for #GstSourceBuffer:tracks.
+
+[Specification](https://www.w3.org/TR/media-source-2/#sourcebuffer-init-segment-received)</doc>
+        <source-position filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.h"/>
+        <return-value transfer-ownership="full">
+          <doc xml:space="preserve" filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c">a #GstStreamCollection with one #GstStream per
+  track, empty before the first initialization segment</doc>
+          <type name="Gst.StreamCollection" c:type="GstStreamCollection*"/>
+        </return-value>
+        <parameters>
+          <instance-parameter name="self" transfer-ownership="none">
+            <doc xml:space="preserve" filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c">#GstSourceBuffer instance</doc>
+            <type name="SourceBuffer" c:type="GstSourceBuffer*"/>
+          </instance-parameter>
+        </parameters>
+      </method>
       <method name="get_updating" c:identifier="gst_source_buffer_get_updating" glib:get-property="updating" version="1.24">
         <doc xml:space="preserve" filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c">[Specification](https://www.w3.org/TR/media-source-2/#dom-sourcebuffer-updating)</doc>
         <source-position filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.h"/>
@@ -978,6 +996,26 @@ earlier.
 
 [Specification](https://www.w3.org/TR/media-source-2/#dom-sourcebuffer-timestampoffset)</doc>
         <type name="gint64" c:type="gint64"/>
+      </property>
+      <property name="tracks" version="1.30" transfer-ownership="none" getter="get_tracks">
+        <doc xml:space="preserve" filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c">The tracks of the initialization segment most recently processed, one
+#GstStream each, with the stream type, the caps parsed from the
+initialization segment that first gave the track and
+%GST_STREAM_FLAG_SELECT on the tracks that are active: the first audio,
+video and text track. A later initialization segment, after a parser
+reset or a content type change, keeps each track it shares with the
+earlier one, and the track keeps its first caps. The stream ids are
+those of the streams #GstMseSrc exposes for the same tracks.
+
+Empty until the first initialization segment has been processed. The
+property is notified when an initialization segment changes the list; a
+parser reset leaves it as it is, since the tracks and their media
+remain. The notification comes from the thread that emits the source
+buffer's signals, after the update-start and before the update-end of
+the append that carried the initialization segment.
+
+[Specification](https://www.w3.org/TR/media-source-2/#sourcebuffer-init-segment-received)</doc>
+        <type name="Gst.StreamCollection"/>
       </property>
       <property name="updating" version="1.24" transfer-ownership="none" getter="get_updating" default-value="FALSE">
         <doc xml:space="preserve" filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c">Whether the current source buffer is still asynchronously processing
