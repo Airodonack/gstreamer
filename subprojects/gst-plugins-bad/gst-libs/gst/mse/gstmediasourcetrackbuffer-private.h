@@ -55,7 +55,7 @@ GArray * gst_media_source_track_buffer_get_ranges (
 
 GST_MSE_PRIVATE
 void gst_media_source_track_buffer_set_group_start (GstMediaSourceTrackBuffer
-    * self, GstClockTime group_start);
+    * self, GstClockTimeDiff group_start);
 
 GST_MSE_PRIVATE
 void gst_media_source_track_buffer_process_init_segment (
