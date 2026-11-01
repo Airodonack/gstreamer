@@ -1795,6 +1795,63 @@ GST_START_TEST (test_source_buffer_buffered_at_update_end)
 
 GST_END_TEST;
 
+/* Appends mse.mp4 to a new MP4 source buffer in the given mode and with the
+ * given timestamp offset, and returns its one buffered range. */
+static GstMediaSourceRange
+buffered_with_offset (GstSourceBufferAppendMode mode, GstClockTimeDiff offset)
+{
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_set_append_mode (source_buffer, mode,
+          &error));
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_set_timestamp_offset (source_buffer, offset,
+          &error));
+  g_assert_no_error (error);
+  gint64 offset_property;
+  g_object_get (source_buffer, "timestamp-offset", &offset_property, NULL);
+  fail_unless_equals_int64 (offset_property, offset);
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+  fail_unless_equals_int (events.error, 0);
+
+  GArray *buffered = gst_source_buffer_get_buffered (source_buffer, &error);
+  g_assert_no_error (error);
+  fail_unless_equals_int (buffered->len, 1);
+  GstMediaSourceRange range = g_array_index (buffered, GstMediaSourceRange, 0);
+  g_array_unref (buffered);
+
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+  return range;
+}
+
+GST_START_TEST (test_source_buffer_negative_timestamp_offset_sequence)
+{
+  /* Proves a negative timestamp offset moves the media earlier in sequence
+   * mode: what would land before zero is dropped, as the append window
+   * drops media before its start, and the rest ends that much earlier. */
+  GstMediaSourceRange plain =
+      buffered_with_offset (GST_SOURCE_BUFFER_APPEND_MODE_SEQUENCE, 0);
+  GstMediaSourceRange earlier =
+      buffered_with_offset (GST_SOURCE_BUFFER_APPEND_MODE_SEQUENCE,
+      -GST_SECOND);
+
+  fail_unless (earlier.start < 100 * GST_MSECOND,
+      "buffered from %" GST_TIMEP_FORMAT, &earlier.start);
+  fail_unless_equals_uint64 (earlier.end, plain.end - GST_SECOND);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_source_buffer_append_after_abort)
 {
   /* Proves an append after abort(), which starts over with an
@@ -3735,6 +3792,8 @@ mse_suite (void)
     tcase_add_test (tc_source_buffer,
         test_source_buffer_buffered_at_update_end);
     tcase_add_test (tc_source_buffer, test_source_buffer_append_after_abort);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_negative_timestamp_offset_sequence);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_parse_error_reported_once);
     tcase_add_test (tc_source_buffer, test_source_buffer_remove_range);
