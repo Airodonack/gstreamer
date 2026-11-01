@@ -29,11 +29,14 @@
 #include "gstmediasource.h"
 #include "gstmselogging-private.h"
 
+/* Sequence mode's timestamps. The group start is the timestamp offset in
+ * effect when the group began, and the offset may be negative: both are
+ * signed, so that media landing before zero can be told apart and dropped. */
 typedef struct
 {
   gboolean enabled;
-  GstClockTime group_start;
-  GstClockTime group_end;
+  GstClockTimeDiff group_start;
+  GstClockTimeDiff group_end;
   GstClockTimeDiff offset;
 
   GstClockTime last_dts;
@@ -66,7 +69,7 @@ struct _GstMediaSourceTrackBuffer
     (g_cond_wait_until (&a->new_data_cond, &a->new_data_mutex, d))
 
 static void timestamps_init (Timestamps * self, gboolean enabled);
-static void timestamps_process (Timestamps * self, GstSample * sample);
+static gboolean timestamps_process (Timestamps * self, GstSample * sample);
 
 G_DEFINE_TYPE (GstMediaSourceTrackBuffer, gst_media_source_track_buffer,
     GST_TYPE_OBJECT);
@@ -129,7 +132,7 @@ gst_media_source_track_buffer_process_init_segment (GstMediaSourceTrackBuffer
 
 void
 gst_media_source_track_buffer_set_group_start (GstMediaSourceTrackBuffer
-    * self, GstClockTime group_start)
+    * self, GstClockTimeDiff group_start)
 {
   g_return_if_fail (GST_IS_MEDIA_SOURCE_TRACK_BUFFER (self));
   if (self->timestamps.enabled) {
@@ -146,7 +149,12 @@ gst_media_source_track_buffer_add (GstMediaSourceTrackBuffer * self,
 
   NEW_DATA_LOCK (self);
 
-  timestamps_process (&self->timestamps, sample);
+  if (!timestamps_process (&self->timestamps, sample)) {
+    GST_TRACE_OBJECT (self, "dropping %" GST_PTR_FORMAT
+        ", it would start before zero", gst_sample_get_buffer (sample));
+    NEW_DATA_UNLOCK (self);
+    return;
+  }
   gst_media_source_sample_map_add (self->samples, sample);
   invalidate_cookie (self);
 
@@ -336,30 +344,34 @@ static void
 timestamps_init (Timestamps * self, gboolean enabled)
 {
   self->enabled = enabled;
-  self->group_start = GST_CLOCK_TIME_NONE;
-  self->group_end = GST_CLOCK_TIME_NONE;
+  self->group_start = GST_CLOCK_STIME_NONE;
+  self->group_end = GST_CLOCK_STIME_NONE;
   self->offset = 0;
   self->last_dts = 0;
   self->last_duration = 0;
 }
 
-static void
+/* Returns FALSE for a frame that would start before zero, which the caller
+ * drops: MSE 3.5.8 Coded Frame Processing adds the timestamp offset, which
+ * may be negative, and then drops a frame whose presentation timestamp is
+ * before the append window start, which is never below zero. */
+static gboolean
 timestamps_process (Timestamps * self, GstSample * sample)
 {
   if (!self->enabled) {
-    return;
+    return TRUE;
   }
 
   GstBuffer *buffer = gst_sample_get_buffer (sample);
   GstClockTime duration = GST_BUFFER_DURATION (buffer);
 
-  GstClockTime pts = 0;
-  GstClockTime dts = 0;
+  GstClockTimeDiff pts = 0;
+  GstClockTimeDiff dts = 0;
 
-  if (GST_CLOCK_TIME_IS_VALID (self->group_start)) {
+  if (GST_CLOCK_STIME_IS_VALID (self->group_start)) {
     self->offset = self->group_start - pts;
     self->group_end = self->group_start;
-    self->group_start = GST_CLOCK_TIME_NONE;
+    self->group_start = GST_CLOCK_STIME_NONE;
   }
 
   if (self->offset != 0) {
@@ -367,18 +379,23 @@ timestamps_process (Timestamps * self, GstSample * sample)
     dts += self->offset;
   }
 
-  GstClockTime end_pts = pts + duration;
+  GstClockTimeDiff end_pts = pts + duration;
 
-  self->last_dts = dts;
-  self->last_duration = duration;
-
-  if (GST_CLOCK_TIME_IS_VALID (self->group_end)) {
+  if (GST_CLOCK_STIME_IS_VALID (self->group_end)) {
     self->group_end = MAX (self->group_end, end_pts);
   }
   self->offset = end_pts;
 
+  if (pts < 0) {
+    return FALSE;
+  }
+
+  self->last_dts = dts;
+  self->last_duration = duration;
+
   GST_BUFFER_PTS (buffer) = pts;
   GST_BUFFER_DTS (buffer) = dts;
+  return TRUE;
 }
 
 gsize
