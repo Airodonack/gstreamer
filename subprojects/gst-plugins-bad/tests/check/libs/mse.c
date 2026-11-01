@@ -1433,6 +1433,69 @@ GST_START_TEST (test_append_pipeline_reset_after_init_segment)
 
 GST_END_TEST;
 
+GST_START_TEST (test_append_pipeline_reset_keeps_tracks)
+{
+  /* Proves the initialization segment after a reset gets the tracks of the
+   * one before when it lists them in another order: a quality switch whose
+   * init segment lists audio before video, with the track ids swapped,
+   * keeps the track objects, which the source buffer's track buffers and
+   * feeds are keyed by. The tracks are made in parsebin's order, sorted
+   * by type, video before audio, so they come up in the same order either
+   * way. */
+  static const gchar *init_segments[] = {
+    "mse-h264-aac-init.mp4",
+    "mse-aac-h264-init.mp4",
+  };
+  AppendPipelineTestContext context = { 0 };
+  GstAppendPipelineCallbacks callbacks = {
+    .eos = test_append_pipeline_eos,
+    .error = test_append_pipeline_error,
+  };
+  GstAppendPipeline *pipeline =
+      gst_append_pipeline_new (&callbacks, &context, NULL);
+  GstCaps *caps = gst_caps_new_simple ("video/quicktime", "variant",
+      G_TYPE_STRING, "iso", NULL);
+  gst_append_pipeline_set_caps (pipeline, caps);
+  gst_caps_unref (caps);
+
+  GstMediaSourceTrack *audio = NULL;
+  GstMediaSourceTrack *video = NULL;
+  for (guint i = 0; i < G_N_ELEMENTS (init_segments); i++) {
+    fail_unless (gst_append_pipeline_append (pipeline,
+            test_file_buffer (init_segments[i])) == GST_FLOW_OK);
+    gst_append_pipeline_eos (pipeline);
+    test_append_pipeline_await_eos (pipeline, &context);
+    fail_if (gst_append_pipeline_get_failed (pipeline));
+
+    GPtrArray *audio_tracks = gst_append_pipeline_get_audio_tracks (pipeline);
+    GPtrArray *video_tracks = gst_append_pipeline_get_video_tracks (pipeline);
+    /* The getters return NULL before an initialization segment. */
+    fail_unless (audio_tracks != NULL && video_tracks != NULL,
+        "%s: no initialization segment", init_segments[i]);
+    fail_unless_equals_int (audio_tracks->len, 1);
+    fail_unless_equals_int (video_tracks->len, 1);
+    if (i == 0) {
+      audio = gst_object_ref (g_ptr_array_index (audio_tracks, 0));
+      video = gst_object_ref (g_ptr_array_index (video_tracks, 0));
+    } else {
+      fail_unless (g_ptr_array_index (audio_tracks, 0) == audio,
+          "%s: a new audio track", init_segments[i]);
+      fail_unless (g_ptr_array_index (video_tracks, 0) == video,
+          "%s: a new video track", init_segments[i]);
+    }
+    g_ptr_array_unref (audio_tracks);
+    g_ptr_array_unref (video_tracks);
+
+    fail_unless (gst_append_pipeline_reset (pipeline));
+  }
+
+  gst_clear_object (&audio);
+  gst_clear_object (&video);
+  gst_object_unref (pipeline);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_track_create_and_free)
 {
   GstMediaSourceTrack *track =
@@ -3849,6 +3912,8 @@ mse_suite (void)
   if (have_qtdemux) {
     tcase_add_test (tc_append_pipeline,
         test_append_pipeline_reset_after_init_segment);
+    tcase_add_test (tc_append_pipeline,
+        test_append_pipeline_reset_keeps_tracks);
   }
 
   tcase_add_test (tc_track, test_track_create_and_free);
