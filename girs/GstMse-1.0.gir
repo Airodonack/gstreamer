@@ -793,8 +793,9 @@ of @self are buffered in memory.
         <doc xml:space="preserve" filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c">[Specification](https://www.w3.org/TR/media-source-2/#dom-sourcebuffer-timestampoffset)</doc>
         <source-position filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.h"/>
         <return-value transfer-ownership="none">
-          <doc xml:space="preserve" filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c">The current timestamp offset as a #GstClockTime</doc>
-          <type name="Gst.ClockTime" c:type="GstClockTime"/>
+          <doc xml:space="preserve" filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c">The current timestamp offset as a #GstClockTimeDiff, which may
+be negative</doc>
+          <type name="Gst.ClockTimeDiff" c:type="GstClockTimeDiff"/>
         </return-value>
         <parameters>
           <instance-parameter name="self" transfer-ownership="none">
@@ -911,7 +912,8 @@ ignored.
       </method>
       <method name="set_timestamp_offset" c:identifier="gst_source_buffer_set_timestamp_offset" glib:set-property="timestamp-offset" version="1.24" throws="1">
         <doc xml:space="preserve" filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c">Attempt to set the timestamp offset of @self. Any media processed after this
-value is set will have this value added to its start time.
+value is set will have this value added to its start time. Media that a
+negative offset would move before zero is dropped.
 
 [Specification](https://www.w3.org/TR/media-source-2/#dom-sourcebuffer-timestampoffset)</doc>
         <source-position filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.h"/>
@@ -925,8 +927,8 @@ value is set will have this value added to its start time.
             <type name="SourceBuffer" c:type="GstSourceBuffer*"/>
           </instance-parameter>
           <parameter name="offset" transfer-ownership="none">
-            <doc xml:space="preserve" filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c">The new timestamp offset</doc>
-            <type name="Gst.ClockTime" c:type="GstClockTime"/>
+            <doc xml:space="preserve" filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c">The new timestamp offset, which may be negative</doc>
+            <type name="Gst.ClockTimeDiff" c:type="GstClockTimeDiff"/>
           </parameter>
         </parameters>
       </method>
@@ -971,7 +973,8 @@ Buffer
       </property>
       <property name="timestamp-offset" version="1.24" writable="1" transfer-ownership="none" setter="set_timestamp_offset" getter="get_timestamp_offset" default-value="0">
         <doc xml:space="preserve" filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c">The next media segment appended to the current Source Buffer will have its
-start timestamp increased by this amount.
+start timestamp increased by this amount. A negative offset moves it
+earlier.
 
 [Specification](https://www.w3.org/TR/media-source-2/#dom-sourcebuffer-timestampoffset)</doc>
         <type name="gint64" c:type="gint64"/>
