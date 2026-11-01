@@ -181,6 +181,9 @@ struct _GstSourceBuffer
   gboolean processed_init_segment;
   GHashTable *track_buffers;
   GHashTable *track_feeds;
+  /* The tracks of the last initialization segment processed, under the
+   * tracks lock. Like the track buffers, they outlive a parser reset. */
+  GstStreamCollection *tracks;
 
   Callbacks callbacks;
 };
@@ -197,6 +200,7 @@ enum
   PROP_BUFFERED,
   PROP_CONTENT_TYPE,
   PROP_TIMESTAMP_OFFSET,
+  PROP_TRACKS,
   PROP_UDPATING,
 
   N_PROPS,
@@ -437,6 +441,7 @@ gst_source_buffer_finalize (GObject * object)
 
   g_hash_table_unref (self->track_buffers);
   g_hash_table_unref (self->track_feeds);
+  gst_clear_object (&self->tracks);
   g_mutex_clear (&self->tracks_lock);
   g_mutex_clear (&self->reset_lock);
 
@@ -469,6 +474,9 @@ gst_source_buffer_get_property (GObject * object, guint prop_id, GValue * value,
       break;
     case PROP_TIMESTAMP_OFFSET:
       g_value_set_int64 (value, gst_source_buffer_get_timestamp_offset (self));
+      break;
+    case PROP_TRACKS:
+      g_value_take_object (value, gst_source_buffer_get_tracks (self));
       break;
     case PROP_UDPATING:
       g_value_set_boolean (value, gst_source_buffer_get_updating (self));
@@ -608,6 +616,30 @@ gst_source_buffer_class_init (GstSourceBufferClass * klass)
       "The next media segment appended to the current Source Buffer"
       " will have its start timestamp increased by this amount",
       G_MININT64, G_MAXINT64, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
+
+  /**
+   * GstSourceBuffer:tracks:
+   *
+   * The tracks of the initialization segment most recently processed, one
+   * #GstStream each, with the stream type, the caps parsed from the
+   * initialization segment and %GST_STREAM_FLAG_SELECT on the tracks that
+   * are active: the first audio, video and text track. The stream ids are
+   * those of the streams #GstMseSrc exposes for the same tracks.
+   *
+   * Empty until the first initialization segment has been processed. The
+   * property is notified when an initialization segment changes the list; a
+   * parser reset leaves it as it is, since the tracks and their media
+   * remain. The notification comes from the thread parsing the append, which
+   * waits for the handlers: they may read the tracks, but must not append,
+   * abort or remove.
+   *
+   * [Specification](https://www.w3.org/TR/media-source-2/#sourcebuffer-init-segment-received)
+   *
+   * Since: 1.30
+   */
+  properties[PROP_TRACKS] = g_param_spec_object ("tracks", "Tracks",
+      "The tracks of the most recent initialization segment",
+      GST_TYPE_STREAM_COLLECTION, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS);
 
   /**
    * GstSourceBuffer:updating:
@@ -969,6 +1001,60 @@ update_track_buffer_modes (GstSourceBuffer * self)
   }
 }
 
+/* One stream per track of the append pipeline's current initialization
+ * segment. */
+static GstStreamCollection *
+new_track_collection (GstSourceBuffer * self)
+{
+  GstStreamCollection *collection = gst_stream_collection_new (NULL);
+  GPtrArray *tracks = gst_source_buffer_get_all_tracks (self);
+  for (guint i = 0; i < tracks->len; i++) {
+    GstMediaSourceTrack *track = g_ptr_array_index (tracks, i);
+    gchar *stream_id = gst_media_source_track_get_stream_id (track);
+    GstStreamFlags flags = gst_media_source_track_get_active (track) ?
+        GST_STREAM_FLAG_SELECT : GST_STREAM_FLAG_NONE;
+    GstStream *stream = gst_stream_new (stream_id,
+        gst_media_source_track_get_initial_caps (track),
+        gst_media_source_track_get_stream_type (track), flags);
+    g_free (stream_id);
+    gst_stream_collection_add_stream (collection, stream);
+  }
+  g_ptr_array_unref (tracks);
+  return collection;
+}
+
+static gboolean
+streams_equal (GstStream * a, GstStream * b)
+{
+  GstCaps *a_caps = gst_stream_get_caps (a);
+  GstCaps *b_caps = gst_stream_get_caps (b);
+  gboolean equal = g_strcmp0 (gst_stream_get_stream_id (a),
+      gst_stream_get_stream_id (b)) == 0
+      && gst_stream_get_stream_type (a) == gst_stream_get_stream_type (b)
+      && gst_stream_get_stream_flags (a) == gst_stream_get_stream_flags (b)
+      && (a_caps == b_caps || (a_caps != NULL && b_caps != NULL
+          && gst_caps_is_equal (a_caps, b_caps)));
+  gst_clear_caps (&a_caps);
+  gst_clear_caps (&b_caps);
+  return equal;
+}
+
+static gboolean
+track_collections_equal (GstStreamCollection * a, GstStreamCollection * b)
+{
+  guint size = gst_stream_collection_get_size (a);
+  if (size != gst_stream_collection_get_size (b)) {
+    return FALSE;
+  }
+  for (guint i = 0; i < size; i++) {
+    if (!streams_equal (gst_stream_collection_get_stream (a, i),
+            gst_stream_collection_get_stream (b, i))) {
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
 static void
 on_received_init_segment (GstAppendPipeline * pipeline, gpointer user_data)
 {
@@ -997,10 +1083,23 @@ on_received_init_segment (GstAppendPipeline * pipeline, gpointer user_data)
 
   update_track_buffer_modes (self);
 
+  GstStreamCollection *tracks = new_track_collection (self);
+  gboolean tracks_changed = !track_collections_equal (self->tracks, tracks);
+  if (tracks_changed) {
+    gst_object_replace ((GstObject **) & self->tracks, GST_OBJECT (tracks));
+  }
+  gst_object_unref (tracks);
+
   TRACKS_UNLOCK (self);
 
   call_received_init_segment (self);
   call_active_state_changed (self);
+
+  /* Last, so that an application reading the tracks from its handler finds
+   * the media source's active source buffers already updated. */
+  if (tracks_changed) {
+    g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_TRACKS]);
+  }
 }
 
 static guint
@@ -1043,6 +1142,7 @@ gst_source_buffer_init (GstSourceBuffer * self)
 
   self->track_feeds = g_hash_table_new_full (g_direct_hash, g_direct_equal,
       NULL, (GDestroyNotify) clear_track_feed);
+  self->tracks = gst_stream_collection_new (NULL);
   self->seek_time = 0;
   self->callbacks.callbacks.duration_changed = NULL;
   self->callbacks.user_data = NULL;
@@ -1455,6 +1555,31 @@ gst_source_buffer_get_buffered (GstSourceBuffer * self, GError ** error)
   GArray *buffered = get_buffered_unlocked (self);
   TRACKS_UNLOCK (self);
   return buffered;
+}
+
+/**
+ * gst_source_buffer_get_tracks:
+ * @self: #GstSourceBuffer instance
+ *
+ * Returns the tracks of the initialization segment @self processed most
+ * recently, as described for #GstSourceBuffer:tracks.
+ *
+ * [Specification](https://www.w3.org/TR/media-source-2/#sourcebuffer-init-segment-received)
+ *
+ * Returns: (transfer full): a #GstStreamCollection with one #GstStream per
+ *   track, empty before the first initialization segment
+ *
+ * Since: 1.30
+ */
+GstStreamCollection *
+gst_source_buffer_get_tracks (GstSourceBuffer * self)
+{
+  g_return_val_if_fail (GST_IS_SOURCE_BUFFER (self), NULL);
+
+  TRACKS_LOCK (self);
+  GstStreamCollection *tracks = gst_object_ref (self->tracks);
+  TRACKS_UNLOCK (self);
+  return tracks;
 }
 
 static GArray *

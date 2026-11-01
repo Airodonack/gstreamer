@@ -755,8 +755,7 @@ is_streamable (GstMediaSourceTrack * track)
 static GstStream *
 create_gst_stream (GstMediaSourceTrack * track)
 {
-  gchar *stream_id = g_strdup_printf ("%s-%s",
-      GST_OBJECT_NAME (track), gst_media_source_track_get_id (track));
+  gchar *stream_id = gst_media_source_track_get_stream_id (track);
   GstStream *stream = gst_stream_new (stream_id,
       gst_media_source_track_get_initial_caps (track),
       gst_media_source_track_get_stream_type (track), GST_STREAM_FLAG_SELECT);
