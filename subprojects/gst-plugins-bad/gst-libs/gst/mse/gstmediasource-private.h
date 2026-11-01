@@ -55,6 +55,11 @@ struct _GstMediaSource
 
   GstClockTime duration;
   GstMediaSourceReadyState ready_state;
+
+  /* Held by the end of stream while it marks the source buffers EOS, and by
+   * a reopen while it changes ready_state and clears them, so that their EOS
+   * always ends up as the last of the two left it. */
+  GMutex eos_lock;
 };
 
 G_END_DECLS

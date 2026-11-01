@@ -74,7 +74,15 @@ GST_MSE_PRIVATE
 void gst_media_source_track_buffer_eos (GstMediaSourceTrackBuffer * self);
 
 GST_MSE_PRIVATE
+void gst_media_source_track_buffer_clear_eos (GstMediaSourceTrackBuffer *
+    self);
+
+GST_MSE_PRIVATE
 gboolean gst_media_source_track_buffer_is_eos (
+    GstMediaSourceTrackBuffer * self);
+
+GST_MSE_PRIVATE
+guint gst_media_source_track_buffer_get_eos_count (
     GstMediaSourceTrackBuffer * self);
 
 GST_MSE_PRIVATE

@@ -107,6 +107,7 @@ static guint signals[N_SIGNALS];
 
 static void rebuild_active_source_buffers (GstMediaSource * self);
 static GPtrArray *detach_unlocked (GstMediaSource * self);
+static void clear_all_source_buffers_eos (GstMediaSource * self);
 static void set_duration_unlocked (GstMediaSource * self,
     GstClockTime duration);
 
@@ -212,6 +213,16 @@ gst_media_source_dispose (GObject * object)
 }
 
 static void
+gst_media_source_finalize (GObject * object)
+{
+  GstMediaSource *self = (GstMediaSource *) object;
+
+  g_mutex_clear (&self->eos_lock);
+
+  G_OBJECT_CLASS (gst_media_source_parent_class)->finalize (object);
+}
+
+static void
 gst_media_source_get_property (GObject * object, guint prop_id, GValue * value,
     GParamSpec * pspec)
 {
@@ -262,6 +273,7 @@ gst_media_source_class_init (GstMediaSourceClass * klass)
   GObjectClass *oclass = G_OBJECT_CLASS (klass);
 
   oclass->dispose = GST_DEBUG_FUNCPTR (gst_media_source_dispose);
+  oclass->finalize = GST_DEBUG_FUNCPTR (gst_media_source_finalize);
   oclass->get_property = GST_DEBUG_FUNCPTR (gst_media_source_get_property);
   oclass->set_property = GST_DEBUG_FUNCPTR (gst_media_source_set_property);
 
@@ -466,6 +478,7 @@ gst_media_source_init (GstMediaSource * self)
   self->element = NULL;
   self->event_queue =
       gst_mse_event_queue_new ((GstMseEventQueueCallback) dispatch_event, self);
+  g_mutex_init (&self->eos_lock);
 }
 
 /**
@@ -564,14 +577,24 @@ gst_media_source_get_source_element (GstMediaSource * self)
   return element;
 }
 
+/* Called by a source buffer, under its object lock but not its tracks lock,
+ * when an append or a setter reopens an ended source. */
 void
 gst_media_source_open (GstMediaSource * self)
 {
   g_return_if_fail (GST_IS_MEDIA_SOURCE (self));
-  if (self->ready_state != GST_MEDIA_SOURCE_READY_STATE_OPEN) {
-    self->ready_state = GST_MEDIA_SOURCE_READY_STATE_OPEN;
+  g_mutex_lock (&self->eos_lock);
+  GST_OBJECT_LOCK (self);
+  GstMediaSourceReadyState ready_state = self->ready_state;
+  self->ready_state = GST_MEDIA_SOURCE_READY_STATE_OPEN;
+  GST_OBJECT_UNLOCK (self);
+  if (ready_state != GST_MEDIA_SOURCE_READY_STATE_OPEN) {
+    if (ready_state == GST_MEDIA_SOURCE_READY_STATE_ENDED) {
+      clear_all_source_buffers_eos (self);
+    }
     schedule_event (self, ON_SOURCE_OPEN);
   }
+  g_mutex_unlock (&self->eos_lock);
 }
 
 /**
@@ -1017,16 +1040,43 @@ error:
   return FALSE;
 }
 
+/* The end of stream marks the buffers after it has set ready_state and let
+ * go of the object lock, so a reopen on another thread may come in between:
+ * the buffers are marked only if the source is still ended. */
 static void
 mark_all_source_buffers_eos (GstMediaSource * self)
+{
+  g_mutex_lock (&self->eos_lock);
+  GST_OBJECT_LOCK (self);
+  gboolean ended = self->ready_state == GST_MEDIA_SOURCE_READY_STATE_ENDED;
+  GST_OBJECT_UNLOCK (self);
+  if (!ended) {
+    GST_DEBUG_OBJECT (self, "reopened before the buffers were marked EOS");
+  }
+  for (guint i = 0; ended; i++) {
+    GstSourceBuffer *buf = gst_source_buffer_list_index (self->buffers, i);
+    if (buf == NULL) {
+      break;
+    }
+    GST_LOG_OBJECT (self, "marking %" GST_PTR_FORMAT " EOS", buf);
+    gst_source_buffer_mark_eos (buf);
+    gst_object_unref (buf);
+  }
+  g_mutex_unlock (&self->eos_lock);
+}
+
+/* Undoes mark_all_source_buffers_eos() when the source reopens: the end of
+ * stream no longer holds, and media appended from now on must play. */
+static void
+clear_all_source_buffers_eos (GstMediaSource * self)
 {
   for (guint i = 0;; i++) {
     GstSourceBuffer *buf = gst_source_buffer_list_index (self->buffers, i);
     if (buf == NULL) {
       return;
     }
-    GST_LOG_OBJECT (self, "marking %" GST_PTR_FORMAT " EOS", buf);
-    gst_source_buffer_mark_eos (buf);
+    GST_LOG_OBJECT (self, "clearing EOS on %" GST_PTR_FORMAT, buf);
+    gst_source_buffer_clear_eos (buf);
     gst_object_unref (buf);
   }
 }
