@@ -85,6 +85,10 @@ GArray * gst_source_buffer_get_buffered (GstSourceBuffer * self,
                                          GError ** error) G_GNUC_WARN_UNUSED_RESULT;
 
 GST_MSE_API
+GstStreamCollection * gst_source_buffer_get_tracks (GstSourceBuffer * self)
+    G_GNUC_WARN_UNUSED_RESULT;
+
+GST_MSE_API
 gboolean gst_source_buffer_set_timestamp_offset (GstSourceBuffer * self,
                                                  GstClockTimeDiff offset,
                                                  GError ** error);
