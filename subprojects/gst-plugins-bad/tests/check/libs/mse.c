@@ -3226,6 +3226,79 @@ GST_START_TEST (test_media_source_supported_webm_content_type)
 
 GST_END_TEST;
 
+/* What isTypeSupported() answers, from the byte stream format registry and
+ * the codecs each format may carry: the media-source web-platform-tests'
+ * cases (codec strings in the wrong container, MPEG audio with a codecs
+ * parameter, incomplete codec ids, empty codec lists) and the codecs of the
+ * formats taken, with the answers Chrome gives. */
+static const struct
+{
+  const gchar *content_type;
+  gboolean supported;
+} content_type_support[] = {
+  {"video/webm;", FALSE},
+  {"video/webm;codecs", FALSE},
+  {"video/webm;codecs=", FALSE},
+  {"video/webm;codecs=\"", FALSE},
+  {"video/webm;codecs=\"\"", FALSE},
+  {"video/webm;codecs=\",\"", FALSE},
+  {"audio/webm;codecs=\"vp8\"", FALSE},
+  {"audio/mp4;codecs=\"avc1.4d001e\"", FALSE},
+  {"audio/mp4;codecs=\"vorbis\"", FALSE},
+  {"audio/webm;codecs=\"mp4a.40.2\"", FALSE},
+  {"video/mp4;codecs=\"vp8\"", FALSE},
+  {"video/mp4;codecs=\"vorbis\"", FALSE},
+  {"video/webm;codecs=\"mp4a.40.2\"", FALSE},
+  {"audio/mpeg;codecs=\"mp3\"", FALSE},
+  {"audio/mpeg;codecs=\"mp4a.69\"", FALSE},
+  {"audio/mpeg;codecs=\"mp4a.6B\"", FALSE},
+  {"audio/aac;codecs=\"aac\"", FALSE},
+  {"audio/aac;codecs=\"adts\"", FALSE},
+  {"audio/aac;codecs=\"mp4a.40\"", FALSE},
+  {"audio/mp4;codecs=\"mp4a\"", FALSE},
+  {"audio/mp4;codecs=\"mp4a.40\"", FALSE},
+  {"audio/mp4;codecs=\"mp4a.40.\"", FALSE},
+  {"audio/mp4;codecs=\"mp4a.67.3\"", FALSE},
+  {"video/mp4;codecs=\"avc1\"", FALSE},
+  {"video/mp4;codecs=\"avc1.4d00\"", FALSE},
+  {"video/mp4;codecs=\"mp4v.20.8\"", FALSE},
+  {"video/mp4;codecs=\"hev1\"", FALSE},
+  {"audio/webm;codecs=\"av01.0.04M.08\"", FALSE},
+  {"video/x-raw", FALSE},
+  {"audio/x-raw", FALSE},
+  {"video/quicktime", FALSE},
+  {"video/x-matroska", FALSE},
+  {"video/mp4", TRUE},
+  {"audio/mp4", TRUE},
+  {"video/webm", TRUE},
+  {"audio/webm", TRUE},
+  {"audio/mpeg", TRUE},
+  {"audio/aac", TRUE},
+  {"video/mp4;codecs=\"avc3.640028\"", TRUE},
+  {"video/mp4;codecs=\"hev1.1.6.L93.B0\"", TRUE},
+  {"video/mp4;codecs=\"hvc1.1.6.L93.B0\"", TRUE},
+  {"video/mp4;codecs=\"av01.0.04M.08\"", TRUE},
+  {"video/mp4;codecs=\"vp09.00.10.08\"", TRUE},
+  {"video/webm;codecs=\"vp9\"", TRUE},
+  {"video/webm;codecs=\"vp09.00.10.08\"", TRUE},
+  {"video/webm;codecs=\"av01.0.04M.08\"", TRUE},
+  {"video/webm;codecs=\"vp9, opus\"", TRUE},
+  {"audio/mp4;codecs=\"mp4a.40.29\"", TRUE},
+  {"audio/mp4;codecs=\"mp4a.69\"", TRUE},
+  {"audio/mp4;codecs=\"mp4a.6B\"", TRUE},
+};
+
+GST_START_TEST (test_media_source_content_type_support)
+{
+  const gchar *content_type = content_type_support[__i__].content_type;
+  gboolean supported = content_type_support[__i__].supported;
+  ck_assert_msg (gst_media_source_is_type_supported (content_type) ==
+      supported, "%s must be %s", content_type,
+      supported ? "supported" : "rejected");
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_sample_map_create_and_destroy)
 {
   GstMediaSourceSampleMap *map = gst_media_source_sample_map_new ();
@@ -3625,6 +3698,9 @@ mse_suite (void)
   tcase_add_loop_test (tc_media_source,
       test_media_source_supported_webm_content_type,
       0, G_N_ELEMENTS (valid_webm_content_types));
+  tcase_add_loop_test (tc_media_source,
+      test_media_source_content_type_support,
+      0, G_N_ELEMENTS (content_type_support));
 
   tcase_add_test (tc_source_buffer, test_source_buffer_generate_timestamps_mp4);
   tcase_add_test (tc_source_buffer, test_source_buffer_generate_timestamps_aac);
