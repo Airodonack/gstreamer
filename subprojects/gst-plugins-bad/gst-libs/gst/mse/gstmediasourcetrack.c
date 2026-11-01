@@ -275,6 +275,18 @@ gst_media_source_track_get_initial_caps (GstMediaSourceTrack * self)
   }
 }
 
+/* The stream id of the track's GstStream, the same in the source buffer's
+ * track list and in the msesrc's stream collection, so that an application
+ * can tell which of the streams it selects came from which source buffer.
+ * The object name makes it unique within the media source; the track id is
+ * only unique within its source buffer. */
+gchar *
+gst_media_source_track_get_stream_id (GstMediaSourceTrack * self)
+{
+  g_return_val_if_fail (GST_IS_MEDIA_SOURCE_TRACK (self), NULL);
+  return g_strdup_printf ("%s-%s", GST_OBJECT_NAME (self), self->track_id);
+}
+
 gboolean
 gst_media_source_track_get_active (GstMediaSourceTrack * self)
 {

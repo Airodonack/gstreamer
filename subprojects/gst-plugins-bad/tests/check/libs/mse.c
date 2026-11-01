@@ -1496,6 +1496,113 @@ GST_START_TEST (test_source_buffer_init_segment_alone_activates)
 GST_END_TEST;
 
 
+static void
+count_tracks_notify (GstSourceBuffer * source_buffer, GParamSpec * pspec,
+    gint * count)
+{
+  g_atomic_int_inc (count);
+}
+
+static GstStream *
+stream_of_type (GstStreamCollection * collection, GstStreamType type)
+{
+  for (guint i = 0; i < gst_stream_collection_get_size (collection); i++) {
+    GstStream *stream = gst_stream_collection_get_stream (collection, i);
+    if (gst_stream_get_stream_type (stream) == type) {
+      return stream;
+    }
+  }
+  return NULL;
+}
+
+static void
+assert_caps_field (GstStream * stream, const gchar * media_type,
+    const gchar * field, gint value)
+{
+  GstCaps *caps = gst_stream_get_caps (stream);
+  fail_unless (GST_IS_CAPS (caps));
+  GstStructure *structure = gst_caps_get_structure (caps, 0);
+  fail_unless (gst_structure_has_name (structure, media_type),
+      "caps %" GST_PTR_FORMAT " are not %s", caps, media_type);
+  gint actual;
+  fail_unless (gst_structure_get_int (structure, field, &actual),
+      "caps %" GST_PTR_FORMAT " have no %s", caps, field);
+  fail_unless_equals_int (actual, value);
+  gst_caps_unref (caps);
+}
+
+GST_START_TEST (test_source_buffer_tracks_from_init_segment)
+{
+  /* Proves a source buffer lists the tracks of its initialization segment,
+   * with the caps parsed from it, notifies the list once, and keeps the
+   * list with the same stream ids across abort() and the same
+   * initialization segment appended again. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  gint notified = 0;
+  g_signal_connect (source_buffer, "notify::tracks",
+      G_CALLBACK (count_tracks_notify), &notified);
+  GError *error = NULL;
+
+  GstStreamCollection *tracks = gst_source_buffer_get_tracks (source_buffer);
+  fail_unless_equals_int (gst_stream_collection_get_size (tracks), 0);
+  gst_object_unref (tracks);
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_file_buffer ("mse-h264-aac-init.mp4"), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+  fail_unless_equals_int (events.error, 0);
+  fail_unless_equals_int (g_atomic_int_get (&notified), 1);
+
+  tracks = gst_source_buffer_get_tracks (source_buffer);
+  fail_unless_equals_int (gst_stream_collection_get_size (tracks), 2);
+  GstStream *video = stream_of_type (tracks, GST_STREAM_TYPE_VIDEO);
+  GstStream *audio = stream_of_type (tracks, GST_STREAM_TYPE_AUDIO);
+  fail_unless (GST_IS_STREAM (video));
+  fail_unless (GST_IS_STREAM (audio));
+  assert_caps_field (video, "video/x-h264", "width", 1280);
+  assert_caps_field (video, "video/x-h264", "height", 720);
+  assert_caps_field (audio, "audio/mpeg", "rate", 44100);
+  assert_caps_field (audio, "audio/mpeg", "channels", 1);
+  fail_unless (gst_stream_get_stream_flags (video) & GST_STREAM_FLAG_SELECT);
+  fail_unless (gst_stream_get_stream_flags (audio) & GST_STREAM_FLAG_SELECT);
+  gchar *video_id = g_strdup (gst_stream_get_stream_id (video));
+  gchar *audio_id = g_strdup (gst_stream_get_stream_id (audio));
+  fail_if (g_str_equal (video_id, audio_id));
+  gst_object_unref (tracks);
+
+  fail_unless (gst_source_buffer_abort (source_buffer, &error));
+  g_assert_no_error (error);
+  tracks = gst_source_buffer_get_tracks (source_buffer);
+  fail_unless_equals_int (gst_stream_collection_get_size (tracks), 2);
+  gst_object_unref (tracks);
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_file_buffer ("mse-h264-aac-init.mp4"), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 2);
+  fail_unless_equals_int (events.error, 0);
+  fail_unless_equals_int (g_atomic_int_get (&notified), 1);
+  tracks = gst_source_buffer_get_tracks (source_buffer);
+  fail_unless_equals_int (gst_stream_collection_get_size (tracks), 2);
+  fail_unless_equals_string (gst_stream_get_stream_id (stream_of_type (tracks,
+              GST_STREAM_TYPE_VIDEO)), video_id);
+  fail_unless_equals_string (gst_stream_get_stream_id (stream_of_type (tracks,
+              GST_STREAM_TYPE_AUDIO)), audio_id);
+  gst_object_unref (tracks);
+
+  g_free (video_id);
+  g_free (audio_id);
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_source_buffer_removed_in_event_handler)
 {
   /* Proves a source buffer can be removed, and lose its last reference,
@@ -2348,6 +2455,8 @@ mse_suite (void)
     tcase_add_test (tc_source_buffer, test_source_buffer_remove_range);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_init_segment_alone_activates);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_tracks_from_init_segment);
   }
 
   tcase_add_test (tc_append_pipeline, test_append_pipeline_create_and_free);

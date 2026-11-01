@@ -53,6 +53,9 @@ GST_MSE_PRIVATE
 gboolean gst_media_source_track_get_active (GstMediaSourceTrack * self);
 
 GST_MSE_PRIVATE
+gchar *gst_media_source_track_get_stream_id (GstMediaSourceTrack * self);
+
+GST_MSE_PRIVATE
 GstMediaSourceTrack *gst_media_source_track_new (GstMediaSourceTrackType type,
     const gchar * track_id);
 
