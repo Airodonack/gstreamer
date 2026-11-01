@@ -862,6 +862,41 @@ is_within_append_window_unlocked (GstSourceBuffer * self, GstSample * sample)
   return end <= self->append_window_end;
 }
 
+/* MSE 3.5.8 Coded Frame Processing adds the timestamp offset to each coded
+ * frame's timestamps in either mode, before the append window check. In
+ * sequence mode the track buffers place the frames, with the offset as
+ * their group start; in segments mode the frames keep their own timestamps,
+ * moved by the offset here. Returns FALSE for a frame the offset moves
+ * before zero, which is before the append window start and dropped. */
+static gboolean
+apply_timestamp_offset_unlocked (GstSourceBuffer * self, GstSample * sample)
+{
+  if (self->append_mode != GST_SOURCE_BUFFER_APPEND_MODE_SEGMENTS
+      || self->timestamp_offset == 0) {
+    return TRUE;
+  }
+
+  GstBuffer *buffer = gst_sample_get_buffer (sample);
+  if (!GST_BUFFER_PTS_IS_VALID (buffer)) {
+    return TRUE;
+  }
+  GstClockTimeDiff pts = GST_BUFFER_PTS (buffer) + self->timestamp_offset;
+  if (pts < 0) {
+    return FALSE;
+  }
+  GST_BUFFER_PTS (buffer) = pts;
+
+  if (GST_BUFFER_DTS_IS_VALID (buffer)) {
+    /* With frames reordered, decode timestamps are earlier than
+     * presentation timestamps, so a frame kept at zero or after can get a
+     * decode timestamp before zero, which a GstClockTime cannot hold: it
+     * is decoded at zero instead. */
+    GstClockTimeDiff dts = GST_BUFFER_DTS (buffer) + self->timestamp_offset;
+    GST_BUFFER_DTS (buffer) = MAX (dts, 0);
+  }
+  return TRUE;
+}
+
 static void
 on_new_sample (GstAppendPipeline * pipeline, GstMediaSourceTrack * track,
     GstSample * sample, gpointer user_data)
@@ -875,7 +910,8 @@ on_new_sample (GstAppendPipeline * pipeline, GstMediaSourceTrack * track,
 #endif
 
   GST_OBJECT_LOCK (self);
-  gboolean is_within_window = is_within_append_window_unlocked (self, sample);
+  gboolean is_within_window = apply_timestamp_offset_unlocked (self, sample)
+      && is_within_append_window_unlocked (self, sample);
   GST_OBJECT_UNLOCK (self);
 
   TRACKS_LOCK (self);
