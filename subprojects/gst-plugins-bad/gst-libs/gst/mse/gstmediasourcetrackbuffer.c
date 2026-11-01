@@ -47,6 +47,7 @@ struct _GstMediaSourceTrackBuffer
   GstMediaSourceSampleMap *samples;
   Timestamps timestamps;
   guint eos;
+  guint eos_count;
 
   guint32 master_cookie;
 
@@ -108,6 +109,7 @@ gst_media_source_track_buffer_init (GstMediaSourceTrackBuffer * self)
 {
   self->samples = gst_media_source_sample_map_new ();
   self->eos = FALSE;
+  self->eos_count = 0;
   self->master_cookie = 0;
   timestamps_init (&self->timestamps, FALSE);
   g_cond_init (&self->new_data_cond);
@@ -176,8 +178,21 @@ gst_media_source_track_buffer_eos (GstMediaSourceTrackBuffer * self)
 {
   g_return_if_fail (GST_IS_MEDIA_SOURCE_TRACK_BUFFER (self));
   NEW_DATA_LOCK (self);
-  g_atomic_int_set (&self->eos, TRUE);
+  if (!is_eos (self)) {
+    g_atomic_int_set (&self->eos, TRUE);
+    g_atomic_int_inc (&self->eos_count);
+  }
   NEW_DATA_SIGNAL (self);
+  NEW_DATA_UNLOCK (self);
+}
+
+/* The source reopened after its end of stream: more media may come. */
+void
+gst_media_source_track_buffer_clear_eos (GstMediaSourceTrackBuffer * self)
+{
+  g_return_if_fail (GST_IS_MEDIA_SOURCE_TRACK_BUFFER (self));
+  NEW_DATA_LOCK (self);
+  g_atomic_int_set (&self->eos, FALSE);
   NEW_DATA_UNLOCK (self);
 }
 
@@ -186,6 +201,16 @@ gst_media_source_track_buffer_is_eos (GstMediaSourceTrackBuffer * self)
 {
   g_return_val_if_fail (GST_IS_MEDIA_SOURCE_TRACK_BUFFER (self), FALSE);
   return is_eos (self);
+}
+
+/* How many times the track buffer has become EOS. A track feed pushes EOS
+ * once for each, even when the source reopened and ended again before the
+ * feed saw it open. */
+guint
+gst_media_source_track_buffer_get_eos_count (GstMediaSourceTrackBuffer * self)
+{
+  g_return_val_if_fail (GST_IS_MEDIA_SOURCE_TRACK_BUFFER (self), 0);
+  return g_atomic_int_get (&self->eos_count);
 }
 
 void

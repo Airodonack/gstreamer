@@ -988,6 +988,26 @@ pad_task (GstMseSrcPad * pad)
     goto pause;
   }
 
+  /* The media source reopened after its end of stream. */
+  if (GST_PAD_IS_EOS (pad)) {
+    if (GST_IS_SAMPLE (object)) {
+      /* It got more media. Only a flush clears the EOS of this pad and of
+       * the elements downstream. The flush keeps the running time, as
+       * playback goes on where it ended, and the segment is sent again. */
+      GST_DEBUG_OBJECT (pad, "more media after EOS, flushing to resume");
+      gst_pad_push_event (GST_PAD (pad), gst_event_new_flush_start ());
+      gst_pad_push_event (GST_PAD (pad), gst_event_new_flush_stop (FALSE));
+      g_atomic_int_set (&pad->does_need_segment, TRUE);
+    } else {
+      /* It ended again with no media in between: the EOS still holds, and
+       * pushing anything more would fail. */
+      GST_LOG_OBJECT (pad, "already EOS");
+      gst_mini_object_unref (object);
+      gst_clear_object (&self);
+      return;
+    }
+  }
+
   if (!g_atomic_int_get (&pad->sent_stream_start)) {
     const gchar *track_id = gst_media_source_track_get_id (track);
     GstEvent *event = gst_event_new_stream_start (track_id);
