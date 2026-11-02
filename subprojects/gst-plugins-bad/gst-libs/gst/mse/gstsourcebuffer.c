@@ -236,6 +236,7 @@ static void call_active_state_changed (GstSourceBuffer * self);
 static GArray *get_buffered_unlocked (GstSourceBuffer * self);
 static inline gboolean is_removed_unlocked (GstSourceBuffer * self);
 static void append_error_unlocked (GstSourceBuffer * self);
+static void reset_parser_state (GstSourceBuffer * self);
 
 static void seek_track_buffer_unlocked (GstMediaSourceTrack * track,
     GstMediaSourceTrackBuffer * buffer, GstSourceBuffer * self);
@@ -947,7 +948,9 @@ on_new_sample (GstAppendPipeline * pipeline, GstMediaSourceTrack * track,
   GST_OBJECT_UNLOCK (self);
 
   TRACKS_LOCK (self);
-  if (is_within_window) {
+  /* A track the first initialization segment did not have is refused in
+   * on_received_init_segment(); its samples have no track buffer. */
+  if (is_within_window && g_hash_table_contains (self->track_buffers, track)) {
     GstMediaSourceTrackBuffer *track_buffer =
         get_track_buffer_unlocked (self, track);
     GST_TRACE_OBJECT (self, "new sample on %s with %" GST_PTR_FORMAT,
@@ -1055,6 +1058,22 @@ track_collections_equal (GstStreamCollection * a, GstStreamCollection * b)
   return TRUE;
 }
 
+/* Whether the tracks of the current initialization segment are the ones of
+ * the first: the append pipeline hands back the same track objects for the
+ * same type and position, so a track buffer exists for each of them. */
+static gboolean
+has_first_init_segment_tracks_unlocked (GstSourceBuffer * self)
+{
+  GPtrArray *tracks = gst_source_buffer_get_all_tracks (self);
+  gboolean matches = tracks->len == g_hash_table_size (self->track_buffers);
+  for (guint i = 0; matches && i < tracks->len; i++) {
+    matches = g_hash_table_contains (self->track_buffers,
+        g_ptr_array_index (tracks, i));
+  }
+  g_ptr_array_unref (tracks);
+  return matches;
+}
+
 static void
 on_received_init_segment (GstAppendPipeline * pipeline, gpointer user_data)
 {
@@ -1063,6 +1082,21 @@ on_received_init_segment (GstAppendPipeline * pipeline, gpointer user_data)
       GST_TIME_ARGS (gst_append_pipeline_get_duration (pipeline)));
 
   TRACKS_LOCK (self);
+
+  if (g_atomic_int_get (&self->processed_init_segment)
+      && !has_first_init_segment_tracks_unlocked (self)) {
+    /* MSE, Initialization Segment Received, step 3: "The number of audio,
+     * video, and text tracks match what was in the first initialization
+     * segment", or the append error algorithm runs. A changeType() makes
+     * this reachable, for example audio bytes appended to a buffer whose
+     * first initialization segment had video. As in on_error(), the append
+     * task reports the error; the samples of the new tracks are dropped. */
+    GST_ERROR_OBJECT (self, "initialization segment does not have the tracks "
+        "of the first");
+    TRACKS_UNLOCK (self);
+    g_atomic_int_set (&self->append_failed, TRUE);
+    return;
+  }
 
   if (g_atomic_int_compare_and_exchange (&self->processed_init_segment, FALSE,
           TRUE)) {
@@ -1643,7 +1677,10 @@ gst_source_buffer_get_content_type (GstSourceBuffer * self)
  * @error: (out) (optional) (nullable) (transfer full): the resulting error or `NULL`
  *
  * Attempts to change the content type of @self to @type. Any new data appended
- * to the Source Buffer must be of the supplied @type afterward.
+ * to the Source Buffer must be of the supplied @type afterward, starting with
+ * an initialization segment.
+ *
+ * [Specification](https://www.w3.org/TR/media-source-2/#dom-sourcebuffer-changetype)
  *
  * Returns: `TRUE` on success, `FALSE` otherwise
  * Since: 1.24
@@ -1661,6 +1698,8 @@ gst_source_buffer_change_content_type (GstSourceBuffer * self,
     return FALSE;
   }
 
+  gboolean supported = gst_media_source_is_type_supported (type);
+
   GST_OBJECT_LOCK (self);
 
   if (is_removed_unlocked (self)) {
@@ -1677,9 +1716,54 @@ gst_source_buffer_change_content_type (GstSourceBuffer * self,
     goto error;
   }
 
-  g_set_error (error,
-      GST_MEDIA_SOURCE_ERROR, GST_MEDIA_SOURCE_ERROR_NOT_SUPPORTED,
-      "content type cannot be changed");
+  if (!supported) {
+    g_set_error (error,
+        GST_MEDIA_SOURCE_ERROR, GST_MEDIA_SOURCE_ERROR_NOT_SUPPORTED,
+        "content type %s is not supported", type);
+    goto error;
+  }
+
+  if (is_ended_unlocked (self)) {
+    open_parent_unlocked (self);
+  }
+
+  GstMediaSourceMediaType media_type = GST_MEDIA_SOURCE_MEDIA_TYPE_INIT;
+  gst_media_source_media_type_parse (&media_type, type);
+  gboolean generate_timestamps = gst_media_source_media_type_generates_timestamp
+      (&media_type);
+  GstCaps *caps = gst_media_source_media_type_get_caps (&media_type);
+  gst_media_source_media_type_reset (&media_type);
+
+  /* The generate timestamps flag follows the new byte stream format. When it
+   * is set the mode becomes sequence; otherwise the spec keeps the previous
+   * mode, even if the old format had forced sequence. */
+  self->generate_timestamps = generate_timestamps;
+  gboolean mode_changed = generate_timestamps
+      && self->append_mode != GST_SOURCE_BUFFER_APPEND_MODE_SEQUENCE;
+  if (generate_timestamps) {
+    self->append_mode = GST_SOURCE_BUFFER_APPEND_MODE_SEQUENCE;
+  }
+  g_free (self->content_type);
+  self->content_type = g_strdup (type);
+
+  GST_OBJECT_UNLOCK (self);
+
+  /* As in gst_source_buffer_new(), the caps tell the parser what the bytes
+   * are when the type is enough to know, and no caps let it typefind them.
+   * The parser takes them when the reset restarts it. After the reset it
+   * needs an initialization segment before it hands out any media, which is
+   * what the spec's pending initialization segment for changeType flag asks
+   * for. */
+  gst_append_pipeline_set_caps (self->append_pipeline, caps);
+  gst_clear_caps (&caps);
+  reset_parser_state (self);
+
+  if (mode_changed) {
+    g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_APPEND_MODE]);
+  }
+  g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_CONTENT_TYPE]);
+
+  return TRUE;
 
 error:
   GST_OBJECT_UNLOCK (self);

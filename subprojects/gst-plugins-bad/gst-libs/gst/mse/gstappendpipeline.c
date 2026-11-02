@@ -90,6 +90,9 @@ struct _GstAppendPipeline
 
   GstPipeline *pipeline;
   GstAppSrc *src;
+  /* The caps the parser starts from: set by gst_append_pipeline_set_caps(),
+   * taken by the next reset when the source has others. */
+  GstCaps *caps;
   GstElement *parsebin;
   GstBus *bus;
 
@@ -1026,18 +1029,24 @@ background_task_cleanup (gpointer ptr)
   g_free (task);
 }
 
-static void
-gst_append_pipeline_init (GstAppendPipeline * self)
+static GstElement *
+new_appsrc (GstAppendPipeline * self)
 {
   GstElement *appsrc = GST_ELEMENT (gst_element_factory_make ("appsrc", "src"));
-  GstElement *parsebin =
-      GST_ELEMENT (gst_element_factory_make ("parsebin", "parse"));
-  GstElement *pipeline = gst_pipeline_new ("append-pipeline");
-
   GstPad *appsrc_pad = GST_PAD (gst_element_get_static_pad (appsrc, "src"));
   gst_pad_add_probe (appsrc_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
       event_probe, self, NULL);
   gst_object_unref (appsrc_pad);
+  return appsrc;
+}
+
+static void
+gst_append_pipeline_init (GstAppendPipeline * self)
+{
+  GstElement *appsrc = new_appsrc (self);
+  GstElement *parsebin =
+      GST_ELEMENT (gst_element_factory_make ("parsebin", "parse"));
+  GstElement *pipeline = gst_pipeline_new ("append-pipeline");
 
   gst_bin_add_many (GST_BIN (pipeline), appsrc, parsebin, NULL);
   if (!gst_element_link (appsrc, parsebin)) {
@@ -1092,6 +1101,7 @@ gst_append_pipeline_finalize (GObject * object)
 
   gst_clear_object (&self->pipeline);
   gst_clear_object (&self->bus);
+  gst_clear_caps (&self->caps);
 
   init_segment_finalize (&self->init_segment);
 
@@ -1150,12 +1160,50 @@ error:
 }
 
 /* Tells the parser what the appended bytes are, so it does not have to
- * typefind them first. */
+ * typefind them first; %NULL caps make it typefind. A source that has no
+ * caps yet takes them at once. One that has other caps keeps them until the
+ * next reset: appsrc cannot go back to no caps, and after a restart it
+ * announces the caps it last pushed before any queued ones, which would make
+ * parsebin pick the old type's demuxer. */
 void
 gst_append_pipeline_set_caps (GstAppendPipeline * self, GstCaps * caps)
 {
   g_return_if_fail (GST_IS_APPEND_PIPELINE (self));
-  gst_app_src_set_caps (self->src, caps);
+  gst_caps_replace (&self->caps, caps);
+  GstCaps *src_caps = gst_app_src_get_caps (self->src);
+  if (src_caps == NULL && caps != NULL) {
+    gst_app_src_set_caps (self->src, caps);
+  }
+  gst_clear_caps (&src_caps);
+}
+
+/* Replaces the stopped pipeline's source with a new one when its caps are
+ * not the ones last set. */
+static void
+renew_appsrc_if_needed (GstAppendPipeline * self)
+{
+  GstCaps *src_caps = gst_app_src_get_caps (self->src);
+  gboolean same = src_caps == self->caps || (src_caps != NULL
+      && self->caps != NULL && gst_caps_is_equal (src_caps, self->caps));
+  gst_clear_caps (&src_caps);
+  if (same) {
+    return;
+  }
+
+  GST_DEBUG_OBJECT (self, "new source for caps %" GST_PTR_FORMAT, self->caps);
+  GstElement *old_appsrc = GST_ELEMENT (self->src);
+  gst_element_set_state (old_appsrc, GST_STATE_NULL);
+  gst_bin_remove (GST_BIN (self->pipeline), old_appsrc);
+
+  GstElement *appsrc = new_appsrc (self);
+  gst_bin_add (GST_BIN (self->pipeline), appsrc);
+  if (!gst_element_link (appsrc, self->parsebin)) {
+    g_error ("failed to link appsrc to parsebin");
+  }
+  if (self->caps != NULL) {
+    gst_app_src_set_caps (GST_APP_SRC (appsrc), self->caps);
+  }
+  self->src = GST_APP_SRC (appsrc);
 }
 
 GstFlowReturn
@@ -1239,6 +1287,8 @@ gst_append_pipeline_reset (GstAppendPipeline * self)
   }
 
   background_task_stop (self->task);
+
+  renew_appsrc_if_needed (self);
 
   /* The appsinks of the old tracks stay in the pipeline otherwise, and the
    * next init segment's appsink of the same name cannot be added, so its
