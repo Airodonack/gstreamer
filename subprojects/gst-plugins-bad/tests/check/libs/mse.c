@@ -1065,22 +1065,221 @@ GST_START_TEST (test_source_buffer_change_content_type_empty)
 
 GST_END_TEST;
 
+static void
+count_notify (GObject * object, GParamSpec * pspec, guint * count)
+{
+  (*count)++;
+}
+
 GST_START_TEST (test_source_buffer_change_content_type)
 {
+  /* Proves a source buffer that has not seen an initialization segment
+   * takes a new type, reads it back and announces it. */
   GstMediaSource *media_source = opened_media_source ();
   GstSourceBuffer *source_buffer = gst_media_source_add_source_buffer
-      (media_source, "video/mp4", NULL);
-
+      (media_source, "video/webm; codecs=\"vp9\"", NULL);
   fail_unless (GST_IS_SOURCE_BUFFER (source_buffer));
+  guint notified = 0;
+  g_signal_connect (source_buffer, "notify::content-type",
+      G_CALLBACK (count_notify), &notified);
 
   GError *error = NULL;
-  gst_source_buffer_change_content_type (source_buffer, "video/webm", &error);
+  fail_unless (gst_source_buffer_change_content_type (source_buffer,
+          "video/mp4; codecs=\"av01.0.00M.08\"", &error));
+  g_assert_no_error (error);
+
+  gchar *content_type = gst_source_buffer_get_content_type (source_buffer);
+  fail_unless_equals_string (content_type,
+      "video/mp4; codecs=\"av01.0.00M.08\"");
+  fail_unless_equals_int (notified, 1);
+
+  g_free (content_type);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_source_buffer_change_content_type_unsupported)
+{
+  /* Proves a type isTypeSupported() refuses is refused here too, and the
+   * source buffer keeps its type. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+
+  GError *error = NULL;
+  fail_if (gst_source_buffer_change_content_type (source_buffer,
+          "video/webm; codecs=\"mp4a.40.2\"", &error));
   g_assert_error (error, GST_MEDIA_SOURCE_ERROR,
       GST_MEDIA_SOURCE_ERROR_NOT_SUPPORTED);
 
+  gchar *content_type = gst_source_buffer_get_content_type (source_buffer);
+  fail_unless_equals_string (content_type, "video/mp4");
+
+  g_free (content_type);
+  g_clear_error (&error);
   gst_object_unref (source_buffer);
   gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_source_buffer_change_content_type_while_updating)
+{
+  /* Proves the type cannot change while an append is in progress. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_get_updating (source_buffer));
+
+  fail_if (gst_source_buffer_change_content_type (source_buffer,
+          "video/webm", &error));
+  g_assert_error (error, GST_MEDIA_SOURCE_ERROR,
+      GST_MEDIA_SOURCE_ERROR_INVALID_STATE);
+  await_update_end (&events, 1);
+
   g_clear_error (&error);
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_source_buffer_change_content_type_generate_timestamps)
+{
+  /* Proves the generate timestamps flag follows the new type: a format
+   * without timestamps switches the buffer to sequence mode, and a change
+   * back keeps that mode but allows segments mode again. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_change_content_type (source_buffer,
+          "audio/aac", &error));
+  g_assert_no_error (error);
+  fail_unless_equals_int (gst_source_buffer_get_append_mode (source_buffer),
+      GST_SOURCE_BUFFER_APPEND_MODE_SEQUENCE);
+  fail_if (gst_source_buffer_set_append_mode (source_buffer,
+          GST_SOURCE_BUFFER_APPEND_MODE_SEGMENTS, &error));
+  g_assert_error (error, GST_MEDIA_SOURCE_ERROR, GST_MEDIA_SOURCE_ERROR_TYPE);
+  g_clear_error (&error);
+
+  fail_unless (gst_source_buffer_change_content_type (source_buffer,
+          "audio/mp4", &error));
+  g_assert_no_error (error);
+  fail_unless_equals_int (gst_source_buffer_get_append_mode (source_buffer),
+      GST_SOURCE_BUFFER_APPEND_MODE_SEQUENCE);
+  fail_unless (gst_source_buffer_set_append_mode (source_buffer,
+          GST_SOURCE_BUFFER_APPEND_MODE_SEGMENTS, &error));
+  g_assert_no_error (error);
+
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
+/* Appends a whole test file to the source buffer and checks that it parsed
+ * without error, leaving n_ranges buffered ranges. */
+static void
+append_test_file_and_check (GstSourceBuffer * source_buffer,
+    SourceBufferEvents * events, const gchar * name, guint update_end,
+    guint n_ranges)
+{
+  GError *error = NULL;
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_file_buffer (name), &error));
+  g_assert_no_error (error);
+  await_update_end (events, update_end);
+  fail_unless_equals_int (events->error, 0);
+
+  GArray *buffered = gst_source_buffer_get_buffered (source_buffer, &error);
+  g_assert_no_error (error);
+  fail_unless_equals_int (buffered->len, n_ranges);
+  g_array_unref (buffered);
+}
+
+GST_START_TEST (test_source_buffer_append_after_change_content_type)
+{
+  /* Proves an append after a change parses the new format: a buffer created
+   * for WebM takes MP4 once its type says so. */
+  GstMediaSource *media_source = opened_media_source ();
+  GstSourceBuffer *source_buffer = gst_media_source_add_source_buffer
+      (media_source, "video/webm", NULL);
+  fail_unless (GST_IS_SOURCE_BUFFER (source_buffer));
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_change_content_type (source_buffer,
+          "video/mp4", &error));
+  g_assert_no_error (error);
+  append_test_file_and_check (source_buffer, &events, "mse.mp4", 1, 1);
+
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_source_buffer_change_content_type_other_tracks)
+{
+  /* Proves an initialization segment after a change still needs the tracks
+   * of the first: mse.mp4 has video, audio and text, the next one only video
+   * and audio, so the append fails. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  append_test_file_and_check (source_buffer, &events, "mse.mp4", 1, 1);
+  fail_unless (gst_source_buffer_change_content_type (source_buffer,
+          "video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"", &error));
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_file_buffer ("mse-h264-aac-init.mp4"), &error));
+  g_assert_no_error (error);
+  await_error (&events, 1);
+  await_update_end (&events, 2);
+
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_source_buffer_change_content_type_after_media)
+{
+  /* Proves a buffer that has already parsed MP4 parses WebM after a change:
+   * the MP4 caps the parser was given are not kept for the new bytes. The
+   * MP4 initialization segment has the video and audio tracks the WebM file
+   * has (mse.mp4 also has a text track, which mse.webm lacks). */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  append_test_file_and_check (source_buffer, &events,
+      "mse-h264-aac-init.mp4", 1, 0);
+  fail_unless (gst_source_buffer_change_content_type (source_buffer,
+          "video/webm", &error));
+  g_assert_no_error (error);
+  append_test_file_and_check (source_buffer, &events, "mse.webm", 2, 1);
+
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
 }
 
 GST_END_TEST;
@@ -2432,6 +2631,10 @@ mse_suite (void)
   tcase_add_test (tc_source_buffer,
       test_source_buffer_change_content_type_empty);
   tcase_add_test (tc_source_buffer, test_source_buffer_change_content_type);
+  tcase_add_test (tc_source_buffer,
+      test_source_buffer_change_content_type_unsupported);
+  tcase_add_test (tc_source_buffer,
+      test_source_buffer_change_content_type_generate_timestamps);
   tcase_add_test (tc_source_buffer, test_source_buffer_set_append_window_start);
   tcase_add_test (tc_source_buffer,
       test_source_buffer_remove_reopens_ended_source);
@@ -2457,6 +2660,14 @@ mse_suite (void)
         test_source_buffer_init_segment_alone_activates);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_tracks_from_init_segment);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_change_content_type_while_updating);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_append_after_change_content_type);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_change_content_type_after_media);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_change_content_type_other_tracks);
   }
 
   tcase_add_test (tc_append_pipeline, test_append_pipeline_create_and_free);
