@@ -623,8 +623,11 @@ gst_source_buffer_class_init (GstSourceBufferClass * klass)
    *
    * The tracks of the initialization segment most recently processed, one
    * #GstStream each, with the stream type, the caps parsed from the
-   * initialization segment and %GST_STREAM_FLAG_SELECT on the tracks that
-   * are active: the first audio, video and text track. The stream ids are
+   * initialization segment that first gave the track and
+   * %GST_STREAM_FLAG_SELECT on the tracks that are active: the first audio,
+   * video and text track. A later initialization segment, after a parser
+   * reset or a content type change, keeps each track it shares with the
+   * earlier one, and the track keeps its first caps. The stream ids are
    * those of the streams #GstMseSrc exposes for the same tracks.
    *
    * Empty until the first initialization segment has been processed. The
