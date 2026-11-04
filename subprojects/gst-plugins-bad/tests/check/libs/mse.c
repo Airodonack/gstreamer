@@ -178,6 +178,79 @@ test_mp4_from_box (const gchar * type)
   return suffix;
 }
 
+typedef void (*Mp4BoxFunc) (guint8 * box, gpointer user_data);
+
+/* Calls func on every box between start and end, and on the boxes inside
+ * the containers on the way to the track IDs and the sample descriptions.
+ * mse.mp4 has no 64-bit box sizes. */
+static void
+mp4_foreach_box (guint8 * data, gsize start, gsize end, Mp4BoxFunc func,
+    gpointer user_data)
+{
+  static const gchar *containers[] = { "moov", "trak", "mdia", "minf",
+    "stbl", "mvex", "moof", "traf"
+  };
+  gsize offset = start;
+  while (offset + 8 <= end) {
+    guint32 size = GST_READ_UINT32_BE (data + offset);
+    fail_unless (size >= 8 && offset + size <= end);
+    func (data + offset, user_data);
+    for (guint i = 0; i < G_N_ELEMENTS (containers); i++) {
+      if (memcmp (data + offset + 4, containers[i], 4) == 0) {
+        mp4_foreach_box (data, offset + 8, offset + size, func, user_data);
+      }
+    }
+    /* A sample description box is a full box with an entry count, then
+     * one box per sample entry. */
+    if (memcmp (data + offset + 4, "stsd", 4) == 0) {
+      mp4_foreach_box (data, offset + 16, offset + size, func, user_data);
+    }
+    offset += size;
+  }
+}
+
+static void
+mp4_edit_boxes (GstBuffer * buffer, Mp4BoxFunc func, gpointer user_data)
+{
+  GstMapInfo map;
+  fail_unless (gst_buffer_map (buffer, &map, GST_MAP_READWRITE));
+  mp4_foreach_box (map.data, 0, map.size, func, user_data);
+  gst_buffer_unmap (buffer, &map);
+}
+
+/* Moves the track with ID 1 to ID 5 where a box names it: the track
+ * header, the track extends box and every track fragment header. */
+static void
+renumber_track_1_to_5 (guint8 * box, gpointer user_data)
+{
+  guint8 *track_id = NULL;
+  if (memcmp (box + 4, "tkhd", 4) == 0) {
+    /* After the version and flags, a creation and a modification time of
+     * 32 bits each in version 0, 64 bits each in version 1. */
+    track_id = box + 12 + (box[8] == 1 ? 16 : 8);
+  } else if (memcmp (box + 4, "trex", 4) == 0
+      || memcmp (box + 4, "tfhd", 4) == 0) {
+    track_id = box + 12;
+  }
+  if (track_id != NULL && GST_READ_UINT32_BE (track_id) == 1) {
+    GST_WRITE_UINT32_BE (track_id, 5);
+    (*(guint *) user_data)++;
+  }
+}
+
+/* The bytes of mse.mp4, or the part of them given, with its video track,
+ * track 1, renumbered to track 5. */
+static GstBuffer *
+with_video_track_5 (GstBuffer * buffer)
+{
+  guint renumbered = 0;
+  mp4_edit_boxes (buffer, renumber_track_1_to_5, &renumbered);
+  /* The track header and the track extends box, and a track fragment
+   * header when there is media. */
+  fail_unless (renumbered >= 2);
+  return buffer;
+}
+
 /* The file type box of mse.mp4 followed by a box whose size field is
  * smaller than a box header, which the demuxer rejects. The padding gives
  * typefinding the 2 KiB it wants before it looks at the bytes. */
@@ -819,6 +892,40 @@ GST_START_TEST (test_append_pipeline_init_segment_alone_has_tracks)
   fail_unless_equals_int (mpeg_version, 4);
   g_ptr_array_unref (video_tracks);
   g_ptr_array_unref (audio_tracks);
+
+  tracks_test_pipeline_free (pipeline, &context);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_append_pipeline_init_segment_new_track_id)
+{
+  /* Proves a later initialization segment whose only video track has
+   * another track ID keeps the video track: the demuxer gives a new pad
+   * for the new ID, and the track count stays that of the first
+   * initialization segment, so it is not reported as a new track. */
+  TracksTestContext context = { 0 };
+  GstAppendPipeline *pipeline = tracks_test_pipeline (&context);
+
+  fail_unless (gst_append_pipeline_append (pipeline,
+          test_mp4_before_box ("moof")) == GST_FLOW_OK);
+  gst_append_pipeline_wait_for_appends (pipeline);
+  GPtrArray *first_video = gst_append_pipeline_get_video_tracks (pipeline);
+  fail_unless (first_video != NULL, "no initialization segment");
+  fail_unless_equals_int (first_video->len, 1);
+
+  fail_unless (gst_append_pipeline_append (pipeline,
+          with_video_track_5 (test_mp4_before_box ("moof"))) == GST_FLOW_OK);
+  gst_append_pipeline_wait_for_appends (pipeline);
+  fail_if (gst_append_pipeline_get_failed (pipeline));
+  fail_unless_equals_int (gst_append_pipeline_n_tracks (pipeline), 3);
+  fail_unless_equals_int (g_atomic_int_get (&context.init_segments), 1);
+  GPtrArray *second_video = gst_append_pipeline_get_video_tracks (pipeline);
+  fail_unless_equals_int (second_video->len, 1);
+  fail_unless (g_ptr_array_index (second_video, 0) ==
+      g_ptr_array_index (first_video, 0));
+  g_ptr_array_unref (first_video);
+  g_ptr_array_unref (second_video);
 
   tracks_test_pipeline_free (pipeline, &context);
 }
@@ -3125,6 +3232,8 @@ mse_suite (void)
   tcase_add_test (tc_append_pipeline, test_append_pipeline_webm);
   tcase_add_test (tc_append_pipeline,
       test_append_pipeline_init_segment_alone_has_tracks);
+  tcase_add_test (tc_append_pipeline,
+      test_append_pipeline_init_segment_new_track_id);
   tcase_add_test (tc_append_pipeline,
       test_append_pipeline_media_segment_feeds_init_segment_tracks);
   tcase_add_test (tc_append_pipeline,

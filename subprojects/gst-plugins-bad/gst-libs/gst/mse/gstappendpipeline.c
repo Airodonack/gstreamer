@@ -580,6 +580,17 @@ link_track (GstAppendPipeline * self, Track * track, GstPad * pad)
       GST_OBJECT_NAME (track->sink), GST_OBJECT_NAME (pad));
 }
 
+static void
+unlink_track (GstAppendPipeline * self, Track * track)
+{
+  GstPad *appsink_pad =
+      gst_element_get_static_pad (GST_ELEMENT (track->sink), "sink");
+  gst_pad_unlink (track->src_pad, appsink_pad);
+  gst_clear_object (&appsink_pad);
+  gst_clear_object (&track->src_pad);
+  gst_clear_object (&track->stream);
+}
+
 static Track *
 find_track (GstAppendPipeline * self, const gchar * stream_id)
 {
@@ -651,9 +662,14 @@ process_init_segment_track (GstPad * pad, GstAppendPipeline * self)
     goto done;
   }
 
-  /* A track the demuxer already gave: its samples can flow now. */
+  /* A track the demuxer already gave: its samples can flow now. A track
+   * whose stream-id changed in a later initialization segment may still be
+   * linked to parsebin's pad for its old stream. */
   Track *track = find_track (self, stream_id);
-  if (track != NULL && track->src_pad == NULL) {
+  if (track != NULL) {
+    if (track->src_pad != NULL) {
+      unlink_track (self, track);
+    }
     link_track (self, track, pad);
     goto done;
   }
@@ -875,6 +891,41 @@ add_demuxer_stream (GstElement * demuxer, GstPad * pad, gpointer user_data)
   return TRUE;
 }
 
+/* The track a demuxer stream with a new stream-id takes over, or NULL.
+ * MSE, Initialization Segment Received, step 3, asks a later
+ * initialization segment for the track IDs of the first only when a type
+ * has more than one track: a lone track of a type may change its ID, for
+ * example in media from another packager, and is still the track of that
+ * type. */
+static Track *
+find_track_with_new_id (GstAppendPipeline * self, GArray * streams,
+    GstStreamType type)
+{
+  guint streams_of_type = 0;
+  for (guint i = 0; i < streams->len; i++) {
+    if (g_array_index (streams, DemuxerStream, i).type == type) {
+      streams_of_type++;
+    }
+  }
+  if (streams_of_type != 1) {
+    return NULL;
+  }
+
+  Track *found = NULL;
+  guint track_count = n_tracks (self);
+  for (guint i = 0; i < track_count; i++) {
+    Track *track = index_track (self, i);
+    if (gst_media_source_track_get_stream_type (track->mse_track) != type) {
+      continue;
+    }
+    if (found != NULL) {
+      return NULL;
+    }
+    found = track;
+  }
+  return found;
+}
+
 /* The demuxer has added a pad for every track of the initialization
  * segment, each with its stream-start and caps: they are the tracks. */
 static void
@@ -892,6 +943,17 @@ on_demuxer_no_more_pads (GstElement * demuxer, gpointer user_data)
   for (guint i = 0; i < streams->len; i++) {
     DemuxerStream *stream = &g_array_index (streams, DemuxerStream, i);
     if (find_track (self, stream->stream_id) != NULL) {
+      continue;
+    }
+    Track *renamed = find_track_with_new_id (self, streams, stream->type);
+    if (renamed != NULL) {
+      /* parsebin's pad for the new stream-id is linked to this track when
+       * it comes, as for any track known from the demuxer. */
+      GST_DEBUG_OBJECT (self, "stream %s continues track %s",
+          stream->stream_id, gst_media_source_track_get_id
+          (renamed->mse_track));
+      g_free (renamed->stream_id);
+      renamed->stream_id = g_strdup (stream->stream_id);
       continue;
     }
     switch (check_track (self, stream->type, stream->caps)) {
