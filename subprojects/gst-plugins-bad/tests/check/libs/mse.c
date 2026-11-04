@@ -1734,6 +1734,34 @@ GST_START_TEST (test_source_buffer_change_content_type_after_parse_error)
 
 GST_END_TEST;
 
+GST_START_TEST (test_source_buffer_init_segment_new_track_id)
+{
+  /* Proves a later initialization segment whose only video track has
+   * another track ID is accepted: MSE asks the track IDs to match only
+   * when a type has more than one track. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          with_video_track_5 (test_mp4_buffer ()), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 2);
+  fail_unless_equals_int (events.error, 0);
+
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
 /* Tells, from any thread, whether a watched object has been disposed. */
 typedef struct
 {
@@ -3425,6 +3453,8 @@ mse_suite (void)
         test_source_buffer_change_content_type_other_tracks);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_change_content_type_after_parse_error);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_init_segment_new_track_id);
   }
 
   tcase_add_test (tc_append_pipeline, test_append_pipeline_create_and_free);
