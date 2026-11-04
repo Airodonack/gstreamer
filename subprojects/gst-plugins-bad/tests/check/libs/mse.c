@@ -2587,10 +2587,10 @@ await_sink_flow (SinkFlow * flow, guint eos, gboolean buffers)
 GST_START_TEST (test_media_source_element_plays_after_reopen)
 {
   /* Proves msesrc's pads push media appended after the end of stream: the
-   * source reopens on the append (MSE, prepare append step 5), and its
-   * pads, which have pushed EOS, push the new media, not a replay of the
-   * old, and then EOS again at the next end of stream; also after the
-   * source has reopened and ended again with no media in between. */
+   * append reopens the source (MSE, prepare append step 5), and its pads,
+   * which have pushed EOS, push the new media, not a replay of the old, and
+   * then EOS again at the next end of stream; also after the source has
+   * reopened and ended again with no media in between. */
   SinkFlow flow = { 0 };
   g_mutex_init (&flow.mutex);
   g_cond_init (&flow.cond);
@@ -2624,22 +2624,21 @@ GST_START_TEST (test_media_source_element_plays_after_reopen)
   g_assert_no_error (error);
   await_sink_flow (&flow, 1, FALSE);
 
-  /* Reopened and ended again with no media in between: the pads' EOS still
-   * holds, and they must stay able to push. */
-  fail_unless (gst_source_buffer_set_timestamp_offset (source_buffer, end,
-          &error));
-  g_assert_no_error (error);
-  fail_unless (gst_media_source_end_of_stream (media_source,
-          GST_MEDIA_SOURCE_EOS_ERROR_NONE, &error));
-  g_assert_no_error (error);
-
-  /* The same file again, after what is buffered. Its fragments give
-   * absolute data offsets, so the parser starts over for it. */
+  /* Reopened by a setter and ended again with no media in between: the
+   * pads' EOS still holds, and they must stay able to push. The offset puts
+   * the same file again after what is buffered; its fragments give absolute
+   * data offsets, so the parser starts over for it, which needs the source
+   * open. */
   fail_unless (gst_source_buffer_set_timestamp_offset (source_buffer, end,
           &error));
   g_assert_no_error (error);
   fail_unless (gst_source_buffer_abort (source_buffer, &error));
   g_assert_no_error (error);
+  fail_unless (gst_media_source_end_of_stream (media_source,
+          GST_MEDIA_SOURCE_EOS_ERROR_NONE, &error));
+  g_assert_no_error (error);
+
+  /* Reopened by the append itself. */
   fail_unless (gst_source_buffer_append_buffer (source_buffer,
           test_mp4_buffer (), &error));
   g_assert_no_error (error);
