@@ -1980,6 +1980,12 @@ track_feed_fold (const GValue * item, TrackFeedAccumulator * acc,
     GST_LOG_OBJECT (self, "%s: pushing group %" GST_TIMEP_FORMAT "-%"
         GST_TIMEP_FORMAT, gst_media_source_track_get_id (feed->track),
         &group->start, &group->end);
+    /* Only the group being pushed can still grow, so only its samples need
+     * remembering: every earlier group now starts behind pushed_dts_end and
+     * is skipped above. Forgetting them drops the feed's references, so
+     * media that remove() or eviction takes out of the track buffer is
+     * freed without waiting for the next seek. */
+    g_hash_table_remove_all (acc->processed_samples);
   }
 
   for (GList * it = group->samples; it != NULL; it = g_list_next (it)) {
