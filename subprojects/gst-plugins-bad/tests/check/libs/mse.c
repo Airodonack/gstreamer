@@ -1665,6 +1665,75 @@ GST_START_TEST (test_source_buffer_change_content_type_after_media)
 
 GST_END_TEST;
 
+typedef struct
+{
+  GMutex mutex;
+  GCond cond;
+  gboolean done;
+  gboolean changed;
+} ChangeTypeInHandler;
+
+static void
+change_type_to_webm (GstSourceBuffer * source_buffer,
+    ChangeTypeInHandler * change)
+{
+  gboolean changed = gst_source_buffer_change_content_type (source_buffer,
+      "video/webm", NULL);
+  g_mutex_lock (&change->mutex);
+  change->changed = changed;
+  change->done = TRUE;
+  g_cond_broadcast (&change->cond);
+  g_mutex_unlock (&change->mutex);
+}
+
+GST_START_TEST (test_source_buffer_change_content_type_after_parse_error)
+{
+  /* Proves a changeType() from the update-end handler of a failed append,
+   * while the append task is still resetting the parser, replaces the
+   * parser's source safely, and the buffer then parses the new type. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  ChangeTypeInHandler change = { 0 };
+  g_mutex_init (&change.mutex);
+  g_cond_init (&change.cond);
+  gulong handler = g_signal_connect (source_buffer, "on-update-end",
+      G_CALLBACK (change_type_to_webm), &change);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_invalid_buffer (), &error));
+  g_assert_no_error (error);
+  await_error (&events, 1);
+  await_update_end (&events, 1);
+  g_mutex_lock (&change.mutex);
+  while (!change.done) {
+    g_cond_wait (&change.cond, &change.mutex);
+  }
+  g_mutex_unlock (&change.mutex);
+  g_signal_handler_disconnect (source_buffer, handler);
+  fail_unless (change.changed);
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_file_buffer ("mse.webm"), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 2);
+  fail_unless_equals_int (events.error, 1);
+  GArray *buffered = gst_source_buffer_get_buffered (source_buffer, &error);
+  g_assert_no_error (error);
+  fail_unless_equals_int (buffered->len, 1);
+  g_array_unref (buffered);
+
+  g_mutex_clear (&change.mutex);
+  g_cond_clear (&change.cond);
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
 /* Tells, from any thread, whether a watched object has been disposed. */
 typedef struct
 {
@@ -3354,6 +3423,8 @@ mse_suite (void)
         test_source_buffer_change_content_type_after_media);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_change_content_type_other_tracks);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_change_content_type_after_parse_error);
   }
 
   tcase_add_test (tc_append_pipeline, test_append_pipeline_create_and_free);
