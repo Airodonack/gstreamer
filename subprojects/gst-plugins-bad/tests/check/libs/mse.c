@@ -2881,6 +2881,115 @@ GST_START_TEST (test_media_source_element_seeks_while_resuming)
 
 GST_END_TEST;
 
+typedef struct
+{
+  GMutex mutex;
+  GCond cond;
+  gboolean ended;
+} SourceEnded;
+
+static void
+note_source_ended (GstMediaSource * media_source, SourceEnded * ended)
+{
+  g_mutex_lock (&ended->mutex);
+  ended->ended = TRUE;
+  g_cond_broadcast (&ended->cond);
+  g_mutex_unlock (&ended->mutex);
+}
+
+static gpointer
+end_stream_on_thread (GstMediaSource * media_source)
+{
+  GError *error = NULL;
+  fail_unless (gst_media_source_end_of_stream (media_source,
+          GST_MEDIA_SOURCE_EOS_ERROR_NONE, &error));
+  g_assert_no_error (error);
+  return NULL;
+}
+
+GST_START_TEST (test_media_source_end_of_stream_races_reopen)
+{
+  /* Proves an end of stream on one thread and a reopen on another leave the
+   * source open with tracks that are not ended, whichever finishes first:
+   * media appended next is followed by an EOS at the next end of stream. */
+  SinkFlow flow = { 0 };
+  g_mutex_init (&flow.mutex);
+  g_cond_init (&flow.cond);
+  flow.pipeline = gst_pipeline_new (NULL);
+  GstElement *src = g_object_new (GST_TYPE_MSE_SRC, NULL);
+  gst_bin_add (GST_BIN (flow.pipeline), src);
+  g_signal_connect (src, "pad-added", G_CALLBACK (link_fakesink), &flow);
+  GstMediaSource *media_source = gst_media_source_new ();
+  gst_media_source_attach (media_source, GST_MSE_SRC (src));
+  fail_if (gst_element_set_state (flow.pipeline, GST_STATE_PLAYING) ==
+      GST_STATE_CHANGE_FAILURE);
+  SourceEnded ended = { 0 };
+  g_mutex_init (&ended.mutex);
+  g_cond_init (&ended.cond);
+  g_signal_connect (media_source, "on-source-ended",
+      G_CALLBACK (note_source_ended), &ended);
+
+  GError *error = NULL;
+  GstSourceBuffer *source_buffer =
+      gst_media_source_add_source_buffer (media_source, "video/mp4", &error);
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_set_append_mode (source_buffer,
+          GST_SOURCE_BUFFER_APPEND_MODE_SEQUENCE, &error));
+  g_assert_no_error (error);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+  GstClockTime end = buffered_end (source_buffer);
+  g_mutex_lock (&flow.mutex);
+  flow.old_end = end;
+  g_mutex_unlock (&flow.mutex);
+
+  /* The reopen comes as soon as the source is ended, which can be before
+   * the end of stream has marked the buffers. */
+  GThread *thread = g_thread_new ("end-of-stream",
+      (GThreadFunc) end_stream_on_thread, media_source);
+  gint64 deadline = g_get_monotonic_time () + EVENT_TIMEOUT;
+  g_mutex_lock (&ended.mutex);
+  while (!ended.ended) {
+    fail_unless (g_cond_wait_until (&ended.cond, &ended.mutex, deadline));
+  }
+  g_mutex_unlock (&ended.mutex);
+  fail_unless (gst_source_buffer_set_timestamp_offset (source_buffer, end,
+          &error));
+  g_assert_no_error (error);
+  g_thread_join (thread);
+  fail_unless_equals_int (gst_media_source_get_ready_state (media_source),
+      GST_MEDIA_SOURCE_READY_STATE_OPEN);
+
+  fail_unless (gst_source_buffer_abort (source_buffer, &error));
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 2);
+  fail_unless_equals_int (events.error, 0);
+  fail_unless (gst_media_source_end_of_stream (media_source,
+          GST_MEDIA_SOURCE_EOS_ERROR_NONE, &error));
+  g_assert_no_error (error);
+  await_sink_ended_after_new (&flow);
+
+  gst_element_set_state (flow.pipeline, GST_STATE_NULL);
+  g_signal_handlers_disconnect_by_data (media_source, &ended);
+  g_mutex_clear (&ended.mutex);
+  g_cond_clear (&ended.cond);
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+  gst_object_unref (flow.pipeline);
+  g_mutex_clear (&flow.mutex);
+  g_cond_clear (&flow.cond);
+}
+
+GST_END_TEST;
+
 /* The memory of the buffers msesrc pushed, and how much of it is freed. */
 typedef struct
 {
@@ -3651,6 +3760,8 @@ mse_suite (void)
         test_media_source_element_ends_after_append_during_feed);
     tcase_add_test (tc_source_buffer,
         test_media_source_element_seeks_while_resuming);
+    tcase_add_test (tc_source_buffer,
+        test_media_source_end_of_stream_races_reopen);
     tcase_add_test (tc_source_buffer,
         test_media_source_element_frees_played_media);
     tcase_add_test (tc_source_buffer, test_track_feed_frees_removed_media);
