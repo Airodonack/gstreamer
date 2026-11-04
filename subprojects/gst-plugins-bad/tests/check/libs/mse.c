@@ -2764,6 +2764,123 @@ GST_START_TEST (test_media_source_element_ends_after_append_during_feed)
 
 GST_END_TEST;
 
+/* Whether msesrc's own flush after its EOS, whose flush-stop keeps the
+ * running time, lands inside a seek's flush on a pad, once `armed`: a
+ * flush-stop like that after two flush-starts. It undoes the seek's
+ * flush-start and lets media from before the seek through. */
+typedef struct
+{
+  GMutex mutex;
+  gboolean armed;
+  guint n_pads;
+  guint flush_starts[8];
+  guint undone;
+} SeekFlush;
+
+static GstPadProbeReturn
+watch_seek_flush (GstPad * pad, GstPadProbeInfo * info, SeekFlush * seek)
+{
+  guint i = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (pad),
+          "seek-index"));
+  GstEvent *event = GST_PAD_PROBE_INFO_EVENT (info);
+  gboolean reset_time = FALSE;
+  g_mutex_lock (&seek->mutex);
+  if (GST_EVENT_TYPE (event) == GST_EVENT_FLUSH_START && seek->armed) {
+    seek->flush_starts[i]++;
+  } else if (GST_EVENT_TYPE (event) == GST_EVENT_FLUSH_STOP) {
+    gst_event_parse_flush_stop (event, &reset_time);
+    seek->undone += !reset_time && seek->flush_starts[i] > 1;
+    seek->flush_starts[i] = 0;
+  }
+  g_mutex_unlock (&seek->mutex);
+  return GST_PAD_PROBE_OK;
+}
+
+static void
+probe_seek_flush (GstElement * src, GstPad * pad, SeekFlush * seek)
+{
+  g_mutex_lock (&seek->mutex);
+  fail_unless (seek->n_pads < G_N_ELEMENTS (seek->flush_starts));
+  g_object_set_data (G_OBJECT (pad), "seek-index",
+      GUINT_TO_POINTER (seek->n_pads++));
+  g_mutex_unlock (&seek->mutex);
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_EVENT_FLUSH,
+      (GstPadProbeCallback) watch_seek_flush, seek, NULL);
+}
+
+GST_START_TEST (test_media_source_element_seeks_while_resuming)
+{
+  /* Proves a seek made while msesrc resumes its pads after a reopen is not
+   * undone by the pads' own flush: no flush-stop that keeps the running
+   * time comes inside the seek's flush. */
+  SeekFlush seek = { 0 };
+  g_mutex_init (&seek.mutex);
+  SinkFlow flow = { 0 };
+  g_mutex_init (&flow.mutex);
+  g_cond_init (&flow.cond);
+  flow.pipeline = gst_pipeline_new (NULL);
+  GstElement *src = g_object_new (GST_TYPE_MSE_SRC, NULL);
+  gst_bin_add (GST_BIN (flow.pipeline), src);
+  g_signal_connect (src, "pad-added", G_CALLBACK (probe_seek_flush), &seek);
+  g_signal_connect (src, "pad-added", G_CALLBACK (link_fakesink), &flow);
+  GstMediaSource *media_source = gst_media_source_new ();
+  gst_media_source_attach (media_source, GST_MSE_SRC (src));
+  fail_if (gst_element_set_state (flow.pipeline, GST_STATE_PLAYING) ==
+      GST_STATE_CHANGE_FAILURE);
+
+  GError *error = NULL;
+  GstSourceBuffer *source_buffer =
+      gst_media_source_add_source_buffer (media_source, "video/mp4", &error);
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_set_append_mode (source_buffer,
+          GST_SOURCE_BUFFER_APPEND_MODE_SEQUENCE, &error));
+  g_assert_no_error (error);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+  GstClockTime end = buffered_end (source_buffer);
+  fail_unless (gst_media_source_end_of_stream (media_source,
+          GST_MEDIA_SOURCE_EOS_ERROR_NONE, &error));
+  g_assert_no_error (error);
+  await_sink_flow (&flow, 1, FALSE);
+
+  fail_unless (gst_source_buffer_set_timestamp_offset (source_buffer, end,
+          &error));
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_abort (source_buffer, &error));
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 2);
+  fail_unless_equals_int (events.error, 0);
+
+  g_mutex_lock (&seek.mutex);
+  seek.armed = TRUE;
+  g_mutex_unlock (&seek.mutex);
+  fail_unless (gst_element_send_event (src, gst_event_new_seek (1.0,
+              GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH, GST_SEEK_TYPE_SET, 0,
+              GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE)));
+  g_mutex_lock (&seek.mutex);
+  guint undone = seek.undone;
+  g_mutex_unlock (&seek.mutex);
+  fail_unless_equals_int (undone, 0);
+
+  gst_element_set_state (flow.pipeline, GST_STATE_NULL);
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+  gst_object_unref (flow.pipeline);
+  g_mutex_clear (&flow.mutex);
+  g_cond_clear (&flow.cond);
+  g_mutex_clear (&seek.mutex);
+}
+
+GST_END_TEST;
+
 /* The memory of the buffers msesrc pushed, and how much of it is freed. */
 typedef struct
 {
@@ -3532,6 +3649,8 @@ mse_suite (void)
         test_media_source_element_plays_after_reopen);
     tcase_add_test (tc_source_buffer,
         test_media_source_element_ends_after_append_during_feed);
+    tcase_add_test (tc_source_buffer,
+        test_media_source_element_seeks_while_resuming);
     tcase_add_test (tc_source_buffer,
         test_media_source_element_frees_played_media);
     tcase_add_test (tc_source_buffer, test_track_feed_frees_removed_media);

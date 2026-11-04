@@ -788,12 +788,18 @@ static void
 flush_stream (GstMseSrc * self, Stream * stream, gboolean is_seek)
 {
   GstMseSrcPad *pad = GST_MSE_SRC_PAD (stream->pad);
+
+  if (is_seek) {
+    /* Before the flush-start: the pad task checks it before it flushes on
+     * its own, see pad_task(). */
+    set_flushing_and_signal (pad);
+  }
+
   gst_pad_push_event (GST_PAD (pad), gst_event_new_flush_start ());
 
   if (is_seek) {
     GST_DEBUG_OBJECT (pad, "flushing for seek to %" GST_TIMEP_FORMAT,
         &self->start_time);
-    set_flushing_and_signal (pad);
     gst_media_source_track_flush (stream->track);
     gst_pad_stop_task (GST_PAD (pad));
     GST_DEBUG_OBJECT (pad, "stopped task");
@@ -995,10 +1001,20 @@ pad_task (GstMseSrcPad * pad)
     if (GST_IS_SAMPLE (object)) {
       /* It got more media. Only a flush clears the EOS of this pad and of
        * the elements downstream. The flush keeps the running time, as
-       * playback goes on where it ended, and the segment is sent again. */
+       * playback goes on where it ended, and the segment is sent again.
+       * A seek sets the pad flushing before its own flush starts, so under
+       * this lock the two flushes cannot interleave: the flush-stop here
+       * never undoes a seek's flush-start. */
+      LINKED_OR_FLUSHING_LOCK (pad);
+      if (is_flushing (pad)) {
+        LINKED_OR_FLUSHING_UNLOCK (pad);
+        GST_DEBUG_OBJECT (pad, "more media after EOS, but flushing");
+        goto pause;
+      }
       GST_DEBUG_OBJECT (pad, "more media after EOS, flushing to resume");
       gst_pad_push_event (GST_PAD (pad), gst_event_new_flush_start ());
       gst_pad_push_event (GST_PAD (pad), gst_event_new_flush_stop (FALSE));
+      LINKED_OR_FLUSHING_UNLOCK (pad);
       g_atomic_int_set (&pad->does_need_segment, TRUE);
     } else {
       /* It ended again with no media in between: the EOS still holds, and
