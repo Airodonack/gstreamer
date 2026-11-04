@@ -67,7 +67,7 @@ gstmse_enums = gnome.mkenums_simple('mse-enumtypes',
   install_dir : join_paths(get_option('includedir'), gstmse_header_dir),
 )
 
-gstmse_deps = [gstbase_dep, gstapp_dep]
+gstmse_deps = [gstbase_dep, gstapp_dep, gstpbutils_dep]
 
 gstmse_enums_private_c = gstmse_enums_private[0]
 gstmse_enums_private_h = gstmse_enums_private[1]

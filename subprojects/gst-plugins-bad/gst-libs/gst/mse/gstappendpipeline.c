@@ -37,6 +37,7 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
+#include <gst/pbutils/pbutils.h>
 
 typedef enum
 {
@@ -804,8 +805,11 @@ done:
   GST_OBJECT_UNLOCK (self);
 }
 
-static GstStreamType
-stream_type_from_caps (GstCaps * caps)
+/* The stream type parsebin would give a stream with these caps: a copy of
+ * guess_stream_type_from_caps() in gstparsebin.c, which is not public.
+ * Tracks from the demuxer and tracks from parsebin's pads must agree. */
+GstStreamType
+gst_append_pipeline_stream_type_from_caps (GstCaps * caps)
 {
   GstStructure *structure = gst_caps_get_structure (caps, 0);
   const gchar *name = gst_structure_get_name (structure);
@@ -823,7 +827,24 @@ stream_type_from_caps (GstCaps * caps)
       || g_str_has_prefix (name, "closedcaption/")) {
     return GST_STREAM_TYPE_TEXT;
   }
-  return GST_STREAM_TYPE_UNKNOWN;
+  if (g_str_has_prefix (name, "meta/")) {
+    return GST_STREAM_TYPE_METADATA;
+  }
+  /* Subtitle formats such as application/x-subtitle-vtt and
+   * application/x-ssa say what they are only in pbutils' table. Only an
+   * elementary stream counts, hence the equality. */
+  switch (gst_pb_utils_get_caps_description_flags (caps)) {
+    case GST_PBUTILS_CAPS_DESCRIPTION_FLAG_AUDIO:
+      return GST_STREAM_TYPE_AUDIO;
+    case GST_PBUTILS_CAPS_DESCRIPTION_FLAG_VIDEO:
+      return GST_STREAM_TYPE_VIDEO;
+    case GST_PBUTILS_CAPS_DESCRIPTION_FLAG_SUBTITLE:
+      return GST_STREAM_TYPE_TEXT;
+    case GST_PBUTILS_CAPS_DESCRIPTION_FLAG_METADATA:
+      return GST_STREAM_TYPE_METADATA;
+    default:
+      return GST_STREAM_TYPE_UNKNOWN;
+  }
 }
 
 typedef struct
@@ -886,7 +907,7 @@ add_demuxer_stream (GstElement * demuxer, GstPad * pad, gpointer user_data)
     demuxer_stream_clear (&stream);
     return TRUE;
   }
-  stream.type = stream_type_from_caps (stream.caps);
+  stream.type = gst_append_pipeline_stream_type_from_caps (stream.caps);
   g_array_append_val (streams, stream);
   return TRUE;
 }
