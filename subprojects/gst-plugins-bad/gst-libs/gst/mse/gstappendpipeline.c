@@ -914,9 +914,10 @@ on_demuxer_no_more_pads (GstElement * demuxer, gpointer user_data)
   if (failed) {
     call_parse_error (self);
   } else if (added || !self->received_init_segment) {
-    /* A later initialization segment with the same tracks, such as a
-     * quality switch, makes the demuxer say no-more-pads again: it
-     * changes no track and is not reported again. */
+    /* With the same tracks, a later initialization segment makes qtdemux
+     * reuse its pads, and it says no-more-pads only when the tracks
+     * change. One that only drops a track adds none here and is not
+     * reported again. */
     report_init_segment (self, demuxer);
   }
   GST_OBJECT_UNLOCK (self);
