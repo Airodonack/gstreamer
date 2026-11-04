@@ -1734,6 +1734,45 @@ GST_START_TEST (test_source_buffer_append_after_abort)
 
 GST_END_TEST;
 
+GST_START_TEST (test_source_buffer_append_after_two_aborts)
+{
+  /* Proves two aborts in a row, with no initialization segment between
+   * them, still give the next one the tracks of the first: the media lands
+   * in the track buffers and feeds the source buffer has, which are keyed
+   * by the track objects. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+
+  fail_unless (gst_source_buffer_abort (source_buffer, &error));
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_abort (source_buffer, &error));
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 2);
+  fail_unless_equals_int (events.error, 0);
+
+  GArray *buffered = gst_source_buffer_get_buffered (source_buffer, &error);
+  g_assert_no_error (error);
+  fail_unless_equals_int (buffered->len, 1);
+  g_array_unref (buffered);
+
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_source_buffer_parse_error_reported_once)
 {
   /* Proves an append of bytes the parser rejects ends with one error and
@@ -3058,6 +3097,8 @@ mse_suite (void)
     tcase_add_test (tc_source_buffer,
         test_source_buffer_buffered_at_update_end);
     tcase_add_test (tc_source_buffer, test_source_buffer_append_after_abort);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_append_after_two_aborts);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_negative_timestamp_offset_sequence);
     tcase_add_test (tc_source_buffer,
