@@ -111,9 +111,10 @@ struct _GstAppendPipeline
    * tracks present; both must not report the same init segment. */
   GstStreamCollection *reported_streams;
   GArray *tracks;
-  /* The tracks before the last reset. The source buffer keeps its track
-   * buffers and feeds for them, so the init segment that follows a reset
-   * gets them back rather than new tracks with the same ids. */
+  /* The tracks of the init segments before the last reset that no init
+   * segment since has taken back. The source buffer keeps its track buffers
+   * and feeds for them, so the init segment that follows a reset gets them
+   * back rather than new tracks with the same ids. */
   GPtrArray *retired_tracks;
 
   gboolean received_init_segment;
@@ -1309,7 +1310,10 @@ gst_append_pipeline_reset (GstAppendPipeline * self)
     gst_bin_remove (GST_BIN (self->pipeline), GST_ELEMENT (track->sink));
   }
 
-  g_ptr_array_set_size (self->retired_tracks, 0);
+  /* Retired tracks no initialization segment has taken back stay retired:
+   * after two resets in a row, the second finds no tracks, and the next
+   * initialization segment must still get the first one's. A track is
+   * either taken back or new, so no type and name is here twice. */
   for (guint i = 0; i < self->tracks->len; i++) {
     Track *track = &g_array_index (self->tracks, Track, i);
     if (track->mse_track != NULL) {
