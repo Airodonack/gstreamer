@@ -957,8 +957,10 @@ gst_queue_locked_dequeue (GstQueue * queue)
 
     switch (GST_EVENT_TYPE (event)) {
       case GST_EVENT_EOS:
-        /* queue is empty now that we dequeued the EOS */
-        GST_QUEUE_CLEAR_LEVEL (queue->cur_level);
+        /* queue is empty now that we dequeued the EOS, unless the buffers of
+         * a new stream are queued behind it: they are still counted */
+        if (queue->cur_level.buffers == 0)
+          GST_QUEUE_CLEAR_LEVEL (queue->cur_level);
         break;
       case GST_EVENT_SEGMENT:
         /* apply newsegment if it has not already been applied */
@@ -1435,6 +1437,27 @@ gst_queue_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
       GST_MINI_OBJECT_CAST (buffer), FALSE);
 }
 
+/* Whether a STREAM_START or SEGMENT is waiting in the queue. Must be called
+ * with the queue lock. */
+static gboolean
+gst_queue_has_stream_start_or_segment (GstQueue * queue)
+{
+  gsize i, len = gst_vec_deque_get_length (queue->queue);
+
+  for (i = 0; i < len; i++) {
+    GstQueueItem *qitem = gst_vec_deque_peek_nth_struct (queue->queue, i);
+
+    if (GST_IS_EVENT (qitem->item)) {
+      GstEventType type = GST_EVENT_TYPE (qitem->item);
+
+      if (type == GST_EVENT_STREAM_START || type == GST_EVENT_SEGMENT)
+        return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
 /* dequeue an item from the queue an push it downstream. This functions returns
  * the result of the push. */
 static GstFlowReturn
@@ -1543,10 +1566,20 @@ next:
     gst_pad_push_event (queue->srcpad, event);
 
     GST_QUEUE_MUTEX_LOCK_CHECK (queue, out_flushing);
-    /* if we're EOS, return EOS so that the task pauses. */
     if (type == GST_EVENT_EOS) {
-      GST_CAT_LOG_OBJECT (queue_dataflow, queue, "pushed EOS event return EOS");
-      result = GST_FLOW_EOS;
+      if (gst_queue_has_stream_start_or_segment (queue)) {
+        /* A STREAM_START or SEGMENT that arrived while this EOS was queued
+         * unset the EOS status, but could not restart the task as it was
+         * still running. Keep the task going to push the new stream. */
+        GST_CAT_LOG_OBJECT (queue_dataflow, queue,
+            "pushed EOS event, new stream queued behind it");
+        result = GST_FLOW_OK;
+      } else {
+        /* if we're EOS, return EOS so that the task pauses. */
+        GST_CAT_LOG_OBJECT (queue_dataflow, queue,
+            "pushed EOS event return EOS");
+        result = GST_FLOW_EOS;
+      }
     }
   } else if (GST_IS_QUERY (data)) {
     GstQuery *query = GST_QUERY_CAST (data);
