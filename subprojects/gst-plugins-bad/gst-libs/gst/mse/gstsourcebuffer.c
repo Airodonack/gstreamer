@@ -2311,8 +2311,8 @@ track_feed_task (TrackFeedTask * feed)
     GstIterator *it = gst_media_source_track_buffer_iter_samples (buffer);
     it = gst_iterator_filter (it, (GCompareFunc) clip_to_seek_time_dts,
         &start_dts_value);
-    gst_iterator_fold (it, (GstIteratorFoldFunction) track_feed_fold,
-        (GValue *) & acc, feed);
+    GstIteratorResult result = gst_iterator_fold (it,
+        (GstIteratorFoldFunction) track_feed_fold, (GValue *) & acc, feed);
     g_clear_pointer (&it, gst_iterator_free);
 
     if (acc.push_failed) {
@@ -2320,9 +2320,24 @@ track_feed_task (TrackFeedTask * feed)
       break;
     }
 
+    /* The track buffer changed under the fold, which then stopped short, or
+     * the source reopened or ended again during it: look again at once, with
+     * the samples already pushed skipped. Its signal came before the wait
+     * below, which would otherwise sleep on it. */
+    if (!g_atomic_int_get (&feed->cancelled)
+        && (result == GST_ITERATOR_RESYNC
+            || gst_media_source_track_buffer_is_eos (buffer) != eos
+            || gst_media_source_track_buffer_get_eos_count (buffer) !=
+            eos_count)) {
+      continue;
+    }
+
     /* The feed keeps running after its EOS: a source that reopens clears the
      * track buffer's EOS, and media appended then follows the EOS on the
-     * track, from where the feed left off, until the next EOS. */
+     * track, from where the feed left off, until the next EOS. The EOS is
+     * pushed only when it held for the whole fold, so it follows all of the
+     * media before it and none appended after a reopen. A reopen from here
+     * on is as if it came after the push. */
     if (eos && eos_count != pushed_eos_count) {
       GST_DEBUG_OBJECT (self, "%s: enqueued all %u samples", track_id,
           g_hash_table_size (acc.processed_samples));

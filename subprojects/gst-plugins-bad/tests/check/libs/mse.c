@@ -2491,7 +2491,9 @@ buffered_end (GstSourceBuffer * source_buffer)
 }
 
 /* What reached the sinks behind msesrc's pads: how many EOS events, and how
- * many buffers since the last one, from which time. */
+ * many buffers since the last one, from which time. With old_end set above
+ * zero, also how many buffers from before it came after an EOS, and whether
+ * one from after it has come. */
 typedef struct
 {
   GMutex mutex;
@@ -2501,6 +2503,9 @@ typedef struct
   guint eos[8];
   guint buffers_after_eos[8];
   GstClockTime first_pts_after_eos[8];
+  GstClockTime old_end;
+  guint old_after_eos[8];
+  gboolean new_seen[8];
 } SinkFlow;
 
 static GstPadProbeReturn
@@ -2509,9 +2514,16 @@ count_sink_flow (GstPad * pad, GstPadProbeInfo * info, SinkFlow * flow)
   guint i = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (pad), "index"));
   g_mutex_lock (&flow->mutex);
   if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER) {
+    GstClockTime pts = GST_BUFFER_PTS (GST_PAD_PROBE_INFO_BUFFER (info));
     if (flow->buffers_after_eos[i]++ == 0) {
-      flow->first_pts_after_eos[i] =
-          GST_BUFFER_PTS (GST_PAD_PROBE_INFO_BUFFER (info));
+      flow->first_pts_after_eos[i] = pts;
+    }
+    if (flow->old_end > 0) {
+      if (pts >= flow->old_end) {
+        flow->new_seen[i] = TRUE;
+      } else if (flow->eos[i] > 0) {
+        flow->old_after_eos[i]++;
+      }
     }
   } else if (GST_EVENT_TYPE (GST_PAD_PROBE_INFO_EVENT (info)) ==
       GST_EVENT_EOS) {
@@ -2644,6 +2656,103 @@ GST_START_TEST (test_media_source_element_plays_after_reopen)
           GST_MEDIA_SOURCE_EOS_ERROR_NONE, &error));
   g_assert_no_error (error);
   await_sink_flow (&flow, 2, FALSE);
+
+  gst_element_set_state (flow.pipeline, GST_STATE_NULL);
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+  gst_object_unref (flow.pipeline);
+  g_mutex_clear (&flow.mutex);
+  g_cond_clear (&flow.cond);
+}
+
+GST_END_TEST;
+
+/* Waits until every sink has had media from after flow->old_end and, after
+ * its last buffer, an EOS. */
+static void
+await_sink_ended_after_new (SinkFlow * flow)
+{
+  gint64 deadline = g_get_monotonic_time () + EVENT_TIMEOUT;
+  g_mutex_lock (&flow->mutex);
+  while (TRUE) {
+    gboolean done = flow->n_sinks > 0;
+    for (guint i = 0; i < flow->n_sinks; i++) {
+      done &= flow->new_seen[i] && flow->eos[i] > 0
+          && flow->buffers_after_eos[i] == 0;
+    }
+    if (done) {
+      break;
+    }
+    if (!g_cond_wait_until (&flow->cond, &flow->mutex, deadline)) {
+      gboolean new_seen = flow->n_sinks ? flow->new_seen[0] : FALSE;
+      guint eos = flow->n_sinks ? flow->eos[0] : 0;
+      g_mutex_unlock (&flow->mutex);
+      ck_abort_msg ("timed out waiting for the new media and an EOS; sink 0 "
+          "had new media %d, %u EOS", new_seen, eos);
+    }
+  }
+  g_mutex_unlock (&flow->mutex);
+}
+
+GST_START_TEST (test_media_source_element_ends_after_append_during_feed)
+{
+  /* Proves a reopen and an append that land while the track feeds are still
+   * pushing the media before the end of stream do not get an EOS pushed in
+   * the middle of it: the old media all comes before any EOS, and the EOS
+   * comes after the new media. */
+  SinkFlow flow = { 0 };
+  g_mutex_init (&flow.mutex);
+  g_cond_init (&flow.cond);
+  flow.pipeline = gst_pipeline_new (NULL);
+  GstElement *src = g_object_new (GST_TYPE_MSE_SRC, NULL);
+  gst_bin_add (GST_BIN (flow.pipeline), src);
+  g_signal_connect (src, "pad-added", G_CALLBACK (link_fakesink), &flow);
+  GstMediaSource *media_source = gst_media_source_new ();
+  gst_media_source_attach (media_source, GST_MSE_SRC (src));
+  fail_if (gst_element_set_state (flow.pipeline, GST_STATE_PLAYING) ==
+      GST_STATE_CHANGE_FAILURE);
+
+  GError *error = NULL;
+  GstSourceBuffer *source_buffer =
+      gst_media_source_add_source_buffer (media_source, "video/mp4", &error);
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_set_append_mode (source_buffer,
+          GST_SOURCE_BUFFER_APPEND_MODE_SEQUENCE, &error));
+  g_assert_no_error (error);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+  GstClockTime end = buffered_end (source_buffer);
+  g_mutex_lock (&flow.mutex);
+  flow.old_end = end;
+  g_mutex_unlock (&flow.mutex);
+
+  /* No wait for the EOS at the sinks: the feeds may still be pushing. */
+  fail_unless (gst_media_source_end_of_stream (media_source,
+          GST_MEDIA_SOURCE_EOS_ERROR_NONE, &error));
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_set_timestamp_offset (source_buffer, end,
+          &error));
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_abort (source_buffer, &error));
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 2);
+  fail_unless_equals_int (events.error, 0);
+  fail_unless (gst_media_source_end_of_stream (media_source,
+          GST_MEDIA_SOURCE_EOS_ERROR_NONE, &error));
+  g_assert_no_error (error);
+
+  await_sink_ended_after_new (&flow);
+  for (guint i = 0; i < flow.n_sinks; i++) {
+    fail_unless_equals_int (flow.old_after_eos[i], 0);
+  }
 
   gst_element_set_state (flow.pipeline, GST_STATE_NULL);
   source_buffer_events_clear (&events, source_buffer);
@@ -3422,6 +3531,8 @@ mse_suite (void)
         test_source_buffer_freed_at_end_of_stream);
     tcase_add_test (tc_source_buffer,
         test_media_source_element_plays_after_reopen);
+    tcase_add_test (tc_source_buffer,
+        test_media_source_element_ends_after_append_during_feed);
     tcase_add_test (tc_source_buffer,
         test_media_source_element_frees_played_media);
     tcase_add_test (tc_source_buffer, test_track_feed_frees_removed_media);
