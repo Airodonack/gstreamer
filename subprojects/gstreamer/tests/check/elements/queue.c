@@ -1383,6 +1383,87 @@ GST_START_TEST (test_time_level_before_output)
 
 GST_END_TEST;
 
+/* A STREAM_START and SEGMENT that arrive while an EOS is still in the queue
+ * must restart the stream behind it: the queue pushes the EOS, then the new
+ * stream, and keeps accepting buffers. */
+GST_START_TEST (test_stream_start_after_queued_eos)
+{
+  GstBuffer *buffer1;
+  GstBuffer *buffer2;
+  GstBuffer *buffer3;
+  GstSegment segment;
+  GstQuery *query;
+  GstEvent *event;
+
+  /* keep everything in the queue until it has the EOS and the new stream */
+  block_src ();
+
+  UNDERRUN_LOCK ();
+  fail_unless (gst_element_set_state (queue,
+          GST_STATE_PLAYING) == GST_STATE_CHANGE_SUCCESS,
+      "could not set to playing");
+  UNDERRUN_WAIT ();
+  UNDERRUN_UNLOCK ();
+
+  gst_segment_init (&segment, GST_FORMAT_BYTES);
+  fail_unless (gst_pad_push_event (mysrcpad,
+          gst_event_new_stream_start ("test")));
+  fail_unless (gst_pad_push_event (mysrcpad, gst_event_new_segment (&segment)));
+  buffer1 = gst_buffer_new_and_alloc (4);
+  fail_unless_equals_int (gst_pad_push (mysrcpad, buffer1), GST_FLOW_OK);
+  fail_unless (gst_pad_push_event (mysrcpad, gst_event_new_eos ()));
+
+  fail_unless (gst_pad_push_event (mysrcpad,
+          gst_event_new_stream_start ("test2")));
+  fail_unless (gst_pad_push_event (mysrcpad, gst_event_new_segment (&segment)));
+  buffer2 = gst_buffer_new_and_alloc (4);
+  fail_unless_equals_int (gst_pad_push (mysrcpad, buffer2), GST_FLOW_OK);
+
+  mysinkpad = setup_sink_pad (queue, &sinktemplate);
+  unblock_src ();
+
+  /* a serialized query returns once the queue has pushed everything before
+   * it, or once its task has paused */
+  query = gst_query_new_drain ();
+  gst_pad_peer_query (mysrcpad, query);
+  gst_query_unref (query);
+
+  g_mutex_lock (&check_mutex);
+  fail_unless_equals_int (g_list_length (buffers), 2);
+  fail_unless (g_list_nth_data (buffers, 0) == buffer1);
+  fail_unless (g_list_nth_data (buffers, 1) == buffer2);
+  g_mutex_unlock (&check_mutex);
+
+  g_mutex_lock (&events_lock);
+  fail_unless_equals_int (g_list_length (events), 5);
+  event = g_list_nth_data (events, 0);
+  fail_unless_equals_int (GST_EVENT_TYPE (event), GST_EVENT_STREAM_START);
+  event = g_list_nth_data (events, 1);
+  fail_unless_equals_int (GST_EVENT_TYPE (event), GST_EVENT_SEGMENT);
+  event = g_list_nth_data (events, 2);
+  fail_unless_equals_int (GST_EVENT_TYPE (event), GST_EVENT_EOS);
+  event = g_list_nth_data (events, 3);
+  fail_unless_equals_int (GST_EVENT_TYPE (event), GST_EVENT_STREAM_START);
+  event = g_list_nth_data (events, 4);
+  fail_unless_equals_int (GST_EVENT_TYPE (event), GST_EVENT_SEGMENT);
+  g_mutex_unlock (&events_lock);
+
+  /* the queue still accepts and pushes data of the new stream */
+  buffer3 = gst_buffer_new_and_alloc (4);
+  fail_unless_equals_int (gst_pad_push (mysrcpad, buffer3), GST_FLOW_OK);
+
+  g_mutex_lock (&check_mutex);
+  while (g_list_length (buffers) < 3)
+    g_cond_wait (&check_cond, &check_mutex);
+  fail_unless (g_list_nth_data (buffers, 2) == buffer3);
+  g_mutex_unlock (&check_mutex);
+
+  fail_unless (gst_element_set_state (queue,
+          GST_STATE_NULL) == GST_STATE_CHANGE_SUCCESS, "could not set to null");
+}
+
+GST_END_TEST;
+
 static Suite *
 queue_suite (void)
 {
@@ -1408,6 +1489,7 @@ queue_suite (void)
   tcase_add_test (tc_chain, test_initial_events_nodelay);
   tcase_add_test (tc_chain, test_flush_on_error);
   tcase_add_test (tc_chain, test_time_level_before_output);
+  tcase_add_test (tc_chain, test_stream_start_after_queued_eos);
 
   return s;
 }
