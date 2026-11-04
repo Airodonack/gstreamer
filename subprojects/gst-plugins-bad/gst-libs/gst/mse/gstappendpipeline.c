@@ -813,7 +813,10 @@ gst_append_pipeline_stream_type_from_caps (GstCaps * caps)
 {
   GstStructure *structure = gst_caps_get_structure (caps, 0);
   const gchar *name = gst_structure_get_name (structure);
-  if (gst_structure_has_field (structure, "original-media-type")) {
+  /* The caps of an encrypted stream name the encryption; the field names
+   * what it carries, and is only of use as a string. */
+  if (gst_structure_has_field_typed (structure, "original-media-type",
+          G_TYPE_STRING)) {
     name = gst_structure_get_string (structure, "original-media-type");
   }
   if (g_str_has_prefix (name, "video/") || g_str_has_prefix (name, "image/")) {
