@@ -2223,6 +2223,54 @@ GST_START_TEST (test_source_buffer_tracks_from_init_segment)
 
 GST_END_TEST;
 
+static void
+record_tracks_notify_thread (GstSourceBuffer * source_buffer,
+    GParamSpec * pspec, gpointer * thread)
+{
+  g_atomic_pointer_set (thread, g_thread_self ());
+}
+
+static void
+record_update_end_thread (GstSourceBuffer * source_buffer, gpointer * thread)
+{
+  g_atomic_pointer_set (thread, g_thread_self ());
+}
+
+GST_START_TEST (test_source_buffer_tracks_notified_with_events)
+{
+  /* Proves notify::tracks comes from the thread that emits the source
+   * buffer's events, as update-end does, and not from the thread parsing
+   * the append, so that its handlers may call the source buffer. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  gpointer notify_thread = NULL;
+  gpointer update_end_thread = NULL;
+  g_signal_connect (source_buffer, "notify::tracks",
+      G_CALLBACK (record_tracks_notify_thread), &notify_thread);
+  g_signal_connect (source_buffer, "on-update-end",
+      G_CALLBACK (record_update_end_thread), &update_end_thread);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_file_buffer ("mse-h264-aac-init.mp4"), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+  fail_unless_equals_int (events.error, 0);
+  fail_unless (g_atomic_pointer_get (&notify_thread) != NULL);
+  fail_unless (g_atomic_pointer_get (&notify_thread) ==
+      g_atomic_pointer_get (&update_end_thread));
+
+  g_signal_handlers_disconnect_by_data (source_buffer, &notify_thread);
+  g_signal_handlers_disconnect_by_data (source_buffer, &update_end_thread);
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_source_buffer_removed_in_event_handler)
 {
   /* Proves a source buffer can be removed, and lose its last reference,
@@ -3291,6 +3339,8 @@ mse_suite (void)
         test_source_buffer_timestamp_offset_segments);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_parse_error_reported_once);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_tracks_notified_with_events);
     tcase_add_test (tc_source_buffer, test_source_buffer_remove_range);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_init_segment_alone_activates);

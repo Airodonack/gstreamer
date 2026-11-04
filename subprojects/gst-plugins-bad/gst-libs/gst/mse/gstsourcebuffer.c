@@ -215,6 +215,10 @@ typedef enum
   ON_ABORT,
 
   N_SIGNALS,
+
+  /* Not a signal: notify::tracks, which is emitted from the same thread as
+   * the signals and in order with them. */
+  NOTIFY_TRACKS = N_SIGNALS,
 } SourceBufferEvent;
 
 typedef struct
@@ -633,9 +637,9 @@ gst_source_buffer_class_init (GstSourceBufferClass * klass)
    * Empty until the first initialization segment has been processed. The
    * property is notified when an initialization segment changes the list; a
    * parser reset leaves it as it is, since the tracks and their media
-   * remain. The notification comes from the thread parsing the append, which
-   * waits for the handlers: they may read the tracks, but must not append,
-   * abort or remove.
+   * remain. The notification comes from the thread that emits the source
+   * buffer's signals, after the update-start and before the update-end of
+   * the append that carried the initialization segment.
    *
    * [Specification](https://www.w3.org/TR/media-source-2/#sourcebuffer-init-segment-received)
    *
@@ -1133,9 +1137,13 @@ on_received_init_segment (GstAppendPipeline * pipeline, gpointer user_data)
   call_active_state_changed (self);
 
   /* Last, so that an application reading the tracks from its handler finds
-   * the media source's active source buffers already updated. */
+   * the media source's active source buffers already updated. Through the
+   * event thread: this is the append pipeline's streaming thread, with its
+   * lock held, where a handler that resets the parser would deadlock. */
   if (tracks_changed) {
-    g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_TRACKS]);
+    GST_OBJECT_LOCK (self);
+    schedule_event_unlocked (self, NOTIFY_TRACKS);
+    GST_OBJECT_UNLOCK (self);
   }
 }
 
@@ -2341,13 +2349,17 @@ track_feed_task (TrackFeedTask * feed)
 static void
 dispatch_event (SourceBufferEventItem * item, GstSourceBuffer * self)
 {
+  if (item->event == NOTIFY_TRACKS) {
+    g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_TRACKS]);
+    return;
+  }
   g_signal_emit (self, signals[item->event], 0);
 }
 
 static void
 schedule_event_unlocked (GstSourceBuffer * self, SourceBufferEvent event)
 {
-  g_return_if_fail (event < N_SIGNALS);
+  g_return_if_fail (event < N_SIGNALS || event == NOTIFY_TRACKS);
   if (is_removed_unlocked (self)) {
     return;
   }
