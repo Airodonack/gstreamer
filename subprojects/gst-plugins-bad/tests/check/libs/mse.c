@@ -251,6 +251,28 @@ with_video_track_5 (GstBuffer * buffer)
   return buffer;
 }
 
+/* Turns the 3GPP timed text sample entry into a WebVTT one, which qtdemux
+ * describes with application/x-subtitle-vtt. */
+static void
+make_text_webvtt (guint8 * box, gpointer user_data)
+{
+  if (memcmp (box + 4, "tx3g", 4) == 0) {
+    memcpy (box + 4, "wvtt", 4);
+    (*(guint *) user_data)++;
+  }
+}
+
+/* The initialization segment of mse.mp4 with a WebVTT text track. */
+static GstBuffer *
+test_mp4_init_segment_with_webvtt (void)
+{
+  GstBuffer *buffer = test_mp4_before_box ("moof");
+  guint changed = 0;
+  mp4_edit_boxes (buffer, make_text_webvtt, &changed);
+  fail_unless_equals_int (changed, 1);
+  return buffer;
+}
+
 /* The file type box of mse.mp4 followed by a box whose size field is
  * smaller than a box header, which the demuxer rejects. The padding gives
  * typefinding the 2 KiB it wants before it looks at the bytes. */
@@ -928,6 +950,61 @@ GST_START_TEST (test_append_pipeline_init_segment_new_track_id)
   g_ptr_array_unref (second_video);
 
   tracks_test_pipeline_free (pipeline, &context);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_append_pipeline_init_segment_webvtt_track)
+{
+  /* Proves a WebVTT track of an MP4 initialization segment is a text
+   * track: its caps, application/x-subtitle-vtt, name no media type that
+   * says so. */
+  TracksTestContext context = { 0 };
+  GstAppendPipeline *pipeline = tracks_test_pipeline (&context);
+
+  fail_unless (gst_append_pipeline_append (pipeline,
+          test_mp4_init_segment_with_webvtt ()) == GST_FLOW_OK);
+  gst_append_pipeline_wait_for_appends (pipeline);
+  fail_if (gst_append_pipeline_get_failed (pipeline));
+  fail_unless_equals_int (g_atomic_int_get (&context.init_segments), 1);
+  fail_unless_equals_int (gst_append_pipeline_n_tracks (pipeline), 3);
+  GPtrArray *text_tracks = gst_append_pipeline_get_text_tracks (pipeline);
+  fail_unless (text_tracks != NULL, "no initialization segment");
+  fail_unless_equals_int (text_tracks->len, 1);
+  g_ptr_array_unref (text_tracks);
+
+  tracks_test_pipeline_free (pipeline, &context);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_append_pipeline_stream_type_from_caps)
+{
+  /* Proves the demuxer's caps give the stream types parsebin gives: the
+   * subtitle formats whose media type does not say so are text, and the
+   * original media type of an encrypted stream counts only when it is a
+   * string. */
+  static const struct
+  {
+    const gchar *caps;
+    GstStreamType type;
+  } cases[] = {
+    {"video/x-h264", GST_STREAM_TYPE_VIDEO},
+    {"audio/mpeg", GST_STREAM_TYPE_AUDIO},
+    {"text/x-raw", GST_STREAM_TYPE_TEXT},
+    {"application/x-subtitle-vtt", GST_STREAM_TYPE_TEXT},
+    {"application/x-ssa", GST_STREAM_TYPE_TEXT},
+    {"application/x-ass", GST_STREAM_TYPE_TEXT},
+    {"application/x-cenc, original-media-type=(string)video/x-h264",
+        GST_STREAM_TYPE_VIDEO},
+  };
+  for (guint i = 0; i < G_N_ELEMENTS (cases); i++) {
+    GstCaps *caps = gst_caps_from_string (cases[i].caps);
+    fail_unless (GST_IS_CAPS (caps));
+    fail_unless_equals_int (gst_append_pipeline_stream_type_from_caps (caps),
+        cases[i].type);
+    gst_caps_unref (caps);
+  }
 }
 
 GST_END_TEST;
@@ -3234,6 +3311,10 @@ mse_suite (void)
       test_append_pipeline_init_segment_alone_has_tracks);
   tcase_add_test (tc_append_pipeline,
       test_append_pipeline_init_segment_new_track_id);
+  tcase_add_test (tc_append_pipeline,
+      test_append_pipeline_init_segment_webvtt_track);
+  tcase_add_test (tc_append_pipeline,
+      test_append_pipeline_stream_type_from_caps);
   tcase_add_test (tc_append_pipeline,
       test_append_pipeline_media_segment_feeds_init_segment_tracks);
   tcase_add_test (tc_append_pipeline,
