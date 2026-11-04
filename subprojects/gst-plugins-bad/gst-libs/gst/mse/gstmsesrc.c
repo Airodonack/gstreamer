@@ -937,15 +937,15 @@ gst_mse_src_send_event (GstElement * element, GstEvent * event)
   gst_event_parse_seek (event, &rate, &format, NULL, &seek_type, &start, NULL,
       NULL);
 
-  gst_event_unref (event);
-
   if (format != GST_FORMAT_TIME || seek_type != GST_SEEK_TYPE_SET || rate < 0) {
     GST_ERROR_OBJECT (self,
         "Rejecting unsupported seek event: %" GST_PTR_FORMAT, event);
+    gst_event_unref (event);
     return FALSE;
   }
 
   GST_DEBUG_OBJECT (self, "handling %" GST_PTR_FORMAT, event);
+  gst_event_unref (event);
   gst_mse_src_seek (self, start, rate);
   return TRUE;
 }

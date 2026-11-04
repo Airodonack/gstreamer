@@ -2990,6 +2990,48 @@ GST_START_TEST (test_media_source_end_of_stream_races_reopen)
 
 GST_END_TEST;
 
+/* Formats every message, as a log function printing it would. */
+static void
+format_debug_message (GstDebugCategory * category, GstDebugLevel level,
+    const gchar * file, const gchar * function, gint line, GObject * object,
+    GstDebugMessage * message, gpointer user_data)
+{
+  (void) gst_debug_message_get (message);
+}
+
+GST_START_TEST (test_media_source_element_seeks_with_debug_output)
+{
+  /* Proves msesrc handles a seek with its debug output on, which prints the
+   * seek event. */
+  gst_debug_remove_log_function (gst_debug_log_default);
+  gst_debug_add_log_function (format_debug_message, NULL, NULL);
+  gst_debug_set_threshold_for_name ("gst-mse", GST_LEVEL_DEBUG);
+
+  GstElement *pipeline = gst_pipeline_new (NULL);
+  GstElement *src = g_object_new (GST_TYPE_MSE_SRC, NULL);
+  gst_bin_add (GST_BIN (pipeline), src);
+  GstMediaSource *media_source = gst_media_source_new ();
+  gst_media_source_attach (media_source, GST_MSE_SRC (src));
+  fail_if (gst_element_set_state (pipeline, GST_STATE_PAUSED) ==
+      GST_STATE_CHANGE_FAILURE);
+
+  fail_unless (gst_element_send_event (src, gst_event_new_seek (1.0,
+              GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH, GST_SEEK_TYPE_SET, 0,
+              GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE)));
+  fail_if (gst_element_send_event (src, gst_event_new_seek (1.0,
+              GST_FORMAT_BYTES, GST_SEEK_FLAG_FLUSH, GST_SEEK_TYPE_SET, 0,
+              GST_SEEK_TYPE_NONE, -1)));
+
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (media_source);
+  gst_object_unref (pipeline);
+  gst_debug_unset_threshold_for_name ("gst-mse");
+  gst_debug_remove_log_function (format_debug_message);
+  gst_debug_add_log_function (gst_debug_log_default, NULL, NULL);
+}
+
+GST_END_TEST;
+
 /* The memory of the buffers msesrc pushed, and how much of it is freed. */
 typedef struct
 {
@@ -3762,6 +3804,8 @@ mse_suite (void)
         test_media_source_element_seeks_while_resuming);
     tcase_add_test (tc_source_buffer,
         test_media_source_end_of_stream_races_reopen);
+    tcase_add_test (tc_source_buffer,
+        test_media_source_element_seeks_with_debug_output);
     tcase_add_test (tc_source_buffer,
         test_media_source_element_frees_played_media);
     tcase_add_test (tc_source_buffer, test_track_feed_frees_removed_media);
