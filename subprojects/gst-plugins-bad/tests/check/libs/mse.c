@@ -997,6 +997,8 @@ GST_START_TEST (test_append_pipeline_stream_type_from_caps)
     {"application/x-ass", GST_STREAM_TYPE_TEXT},
     {"application/x-cenc, original-media-type=(string)video/x-h264",
         GST_STREAM_TYPE_VIDEO},
+    {"application/x-cenc, original-media-type=(int)1",
+        GST_STREAM_TYPE_UNKNOWN},
   };
   for (guint i = 0; i < G_N_ELEMENTS (cases); i++) {
     GstCaps *caps = gst_caps_from_string (cases[i].caps);
