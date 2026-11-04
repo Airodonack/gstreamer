@@ -2286,6 +2286,121 @@ GST_START_TEST (test_media_source_element_plays_after_reopen)
 
 GST_END_TEST;
 
+/* The memory of the buffers msesrc pushed, and how much of it is freed. */
+typedef struct
+{
+  GMutex mutex;
+  GCond cond;
+  GHashTable *live;
+  guint pushed;
+  guint freed;
+} PushedMemory;
+
+static void
+pushed_memory_freed (PushedMemory * pushed, GstMiniObject * where)
+{
+  g_mutex_lock (&pushed->mutex);
+  g_hash_table_remove (pushed->live, where);
+  pushed->freed++;
+  g_cond_broadcast (&pushed->cond);
+  g_mutex_unlock (&pushed->mutex);
+}
+
+static GstPadProbeReturn
+watch_pushed_memory (GstPad * pad, GstPadProbeInfo * info,
+    PushedMemory * pushed)
+{
+  GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER (info);
+  g_mutex_lock (&pushed->mutex);
+  for (guint i = 0; i < gst_buffer_n_memory (buffer); i++) {
+    GstMemory *memory = gst_buffer_peek_memory (buffer, i);
+    if (g_hash_table_add (pushed->live, memory)) {
+      gst_mini_object_weak_ref (GST_MINI_OBJECT (memory),
+          (GstMiniObjectNotify) pushed_memory_freed, pushed);
+      pushed->pushed++;
+    }
+  }
+  g_mutex_unlock (&pushed->mutex);
+  return GST_PAD_PROBE_OK;
+}
+
+static void
+probe_pushed_memory (GstElement * src, GstPad * pad, PushedMemory * pushed)
+{
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER,
+      (GstPadProbeCallback) watch_pushed_memory, pushed, NULL);
+}
+
+GST_START_TEST (test_media_source_element_frees_played_media)
+{
+  /* Proves the media msesrc has played is freed once the pipeline, the
+   * media source and its source buffer are gone, instead of living on for
+   * as long as the process does. */
+  PushedMemory pushed = { 0 };
+  g_mutex_init (&pushed.mutex);
+  g_cond_init (&pushed.cond);
+  pushed.live = g_hash_table_new (g_direct_hash, g_direct_equal);
+  SinkFlow flow = { 0 };
+  g_mutex_init (&flow.mutex);
+  g_cond_init (&flow.cond);
+  flow.pipeline = gst_pipeline_new (NULL);
+  GstElement *src = g_object_new (GST_TYPE_MSE_SRC, NULL);
+  gst_bin_add (GST_BIN (flow.pipeline), src);
+  /* The probe goes on before the pad is linked, so it sees every buffer. */
+  g_signal_connect (src, "pad-added", G_CALLBACK (probe_pushed_memory),
+      &pushed);
+  g_signal_connect (src, "pad-added", G_CALLBACK (link_fakesink), &flow);
+  GstMediaSource *media_source = gst_media_source_new ();
+  gst_media_source_attach (media_source, GST_MSE_SRC (src));
+  fail_if (gst_element_set_state (flow.pipeline, GST_STATE_PLAYING) ==
+      GST_STATE_CHANGE_FAILURE);
+
+  GError *error = NULL;
+  GstSourceBuffer *source_buffer =
+      gst_media_source_add_source_buffer (media_source, "video/mp4", &error);
+  g_assert_no_error (error);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+  fail_unless_equals_int (events.error, 0);
+  fail_unless (gst_media_source_end_of_stream (media_source,
+          GST_MEDIA_SOURCE_EOS_ERROR_NONE, &error));
+  g_assert_no_error (error);
+  await_sink_flow (&flow, 1, FALSE);
+
+  gst_element_set_state (flow.pipeline, GST_STATE_NULL);
+  gst_object_unref (flow.pipeline);
+  DisposeWatch watch;
+  dispose_watch_init (&watch, source_buffer);
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+  fail_unless (dispose_watch_await (&watch), "the source buffer was not freed");
+  dispose_watch_clear (&watch);
+
+  gint64 deadline = g_get_monotonic_time () + EVENT_TIMEOUT;
+  g_mutex_lock (&pushed.mutex);
+  fail_unless (pushed.pushed > 0, "msesrc pushed no media");
+  while (pushed.freed < pushed.pushed
+      && g_cond_wait_until (&pushed.cond, &pushed.mutex, deadline)) {
+  }
+  guint n_pushed = pushed.pushed;
+  guint n_freed = pushed.freed;
+  g_mutex_unlock (&pushed.mutex);
+  fail_unless_equals_int (n_freed, n_pushed);
+
+  g_hash_table_unref (pushed.live);
+  g_mutex_clear (&pushed.mutex);
+  g_cond_clear (&pushed.cond);
+  g_mutex_clear (&flow.mutex);
+  g_cond_clear (&flow.cond);
+}
+
+GST_END_TEST;
+
 static const gchar *unsupported_content_types[] = {
   "xxx",
   "text/html",
@@ -2842,6 +2957,8 @@ mse_suite (void)
         test_source_buffer_freed_at_end_of_stream);
     tcase_add_test (tc_source_buffer,
         test_media_source_element_plays_after_reopen);
+    tcase_add_test (tc_source_buffer,
+        test_media_source_element_frees_played_media);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_buffered_at_update_end);
     tcase_add_test (tc_source_buffer, test_source_buffer_append_after_abort);
