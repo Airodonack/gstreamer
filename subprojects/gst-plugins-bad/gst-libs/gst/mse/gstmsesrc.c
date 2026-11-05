@@ -967,6 +967,9 @@ static void
 pad_task (GstMseSrcPad * pad)
 {
   GstMseSrc *self = NULL;
+  /* Popping a sample or an event from the track hands this task the
+   * track's reference to it: it is dropped on every way out below. */
+  GstMiniObject *object = NULL;
   gboolean flushing = await_pad_linked_or_flushing (pad);
   if (flushing) {
     GST_TRACE_OBJECT (pad, "pad is flushing");
@@ -977,7 +980,7 @@ pad_task (GstMseSrcPad * pad)
 
   GstMediaSourceTrack *track = pad->track;
 
-  GstMiniObject *object = gst_media_source_track_pop (track);
+  object = gst_media_source_track_pop (track);
 
   if (object == NULL) {
     GST_DEBUG_OBJECT (pad, "nothing was popped from track, must be flushing");
@@ -1091,6 +1094,7 @@ pad_task (GstMseSrcPad * pad)
     g_assert_not_reached ();
   }
 
+  gst_clear_mini_object (&object);
   gst_clear_object (&self);
   return;
 
@@ -1098,6 +1102,7 @@ pause:
   if (!g_atomic_int_get (&pad->flushing)) {
     gst_pad_pause_task (GST_PAD (pad));
   }
+  gst_clear_mini_object (&object);
   gst_clear_object (&self);
 }
 
