@@ -69,10 +69,12 @@
 #define DECODE_ERROR "decode error"
 #define NETWORK_ERROR "network error"
 
-/* How long before playback reaches the end of a track a pad sends its EOS,
- * so that the EOS gets through the queues and lets the decoder drain before
- * the sink runs out of media. */
-#define EOS_HOLD_MARGIN (200 * GST_MSECOND)
+/* How many frames before playback reaches the end of a video track its pad
+ * sends the EOS. A video decoder may hold its last few frames until the EOS
+ * drains it, and the sink needs them on time; Chromium's video renderer
+ * keeps 4 frames queued (media/base/limits.h, kMaxVideoFrames). Audio and
+ * other tracks send their EOS at the end itself. */
+#define EOS_HOLD_VIDEO_FRAMES 4
 
 enum
 {
@@ -134,6 +136,7 @@ struct _GstMseSrcPad
   /* The end of the media pushed since the last segment, and the wait for
    * playback to reach it before the EOS is pushed, see hold_eos(). */
   GstClockTime pushed_end;
+  GstClockTime pushed_duration;
   GMutex eos_hold_lock;
   GCond eos_hold_cond;
   GstClockID eos_hold_id;
@@ -214,6 +217,7 @@ gst_mse_src_pad_init (GstMseSrcPad * self)
   g_mutex_init (&self->linked_or_flushing_lock);
   g_cond_init (&self->linked_or_flushing_cond);
   self->pushed_end = GST_CLOCK_TIME_NONE;
+  self->pushed_duration = GST_CLOCK_TIME_NONE;
   g_mutex_init (&self->eos_hold_lock);
   g_cond_init (&self->eos_hold_cond);
   self->eos_hold_id = NULL;
@@ -843,6 +847,7 @@ flush_stream (GstMseSrc * self, Stream * stream, gboolean is_seek)
 
   g_atomic_int_set (&pad->does_need_segment, TRUE);
   pad->pushed_end = GST_CLOCK_TIME_NONE;
+  pad->pushed_duration = GST_CLOCK_TIME_NONE;
 
   gst_pad_push_event (GST_PAD (pad), gst_event_new_flush_stop (is_seek));
 }
@@ -1029,6 +1034,31 @@ wake_eos_hold (GstMseSrcPad * pad)
   EOS_HOLD_UNLOCK (pad);
 }
 
+/* How long before the end of its media the pad sends its EOS: for video,
+ * EOS_HOLD_VIDEO_FRAMES frames of the duration of the last frame pushed, or
+ * of the caps' framerate when that frame had none; nothing if neither is
+ * known, and for other tracks. */
+static GstClockTime
+eos_hold_margin (GstMseSrcPad * pad)
+{
+  if (gst_media_source_track_get_track_type (pad->track) !=
+      GST_MEDIA_SOURCE_TRACK_TYPE_VIDEO) {
+    return 0;
+  }
+  if (GST_CLOCK_TIME_IS_VALID (pad->pushed_duration)) {
+    return EOS_HOLD_VIDEO_FRAMES * pad->pushed_duration;
+  }
+  gint num = 0, den = 1;
+  if (GST_IS_CAPS (pad->most_recent_caps)
+      && !gst_caps_is_empty (pad->most_recent_caps)
+      && gst_structure_get_fraction (gst_caps_get_structure
+          (pad->most_recent_caps, 0), "framerate", &num, &den) && num > 0) {
+    return gst_util_uint64_scale_int (EOS_HOLD_VIDEO_FRAMES * GST_SECOND,
+        den, num);
+  }
+  return 0;
+}
+
 typedef enum
 {
   EOS_HOLD_REACHED,
@@ -1041,7 +1071,7 @@ typedef enum
  * ever reaching the old end. An EOS in GStreamer is final for the stream and
  * downstream acts on it as soon as it gets it, while the media before it is
  * still queued. So the EOS a track ends with is held here until running
- * time comes within EOS_HOLD_MARGIN of the end of the media pushed, as a
+ * time comes within eos_hold_margin() of the end of the media pushed, as a
  * browser tells its decoder of the end only when playback gets there. New
  * media on the track meanwhile means the source reopened: the EOS is
  * dropped and the media follows the old with nothing between them. While
@@ -1084,8 +1114,8 @@ hold_eos (GstMseSrcPad * pad, GstMseSrc * self)
       continue;
     }
     GstClockTime base_time = gst_element_get_base_time (GST_ELEMENT (self));
-    GstClockTime target = base_time + (end > EOS_HOLD_MARGIN ?
-        end - EOS_HOLD_MARGIN : 0);
+    GstClockTime margin = eos_hold_margin (pad);
+    GstClockTime target = base_time + (end > margin ? end - margin : 0);
     GST_DEBUG_OBJECT (pad, "holding EOS until running time %"
         GST_TIMEP_FORMAT, &end);
     GstClockID id = gst_clock_new_single_shot_id (clock, target);
@@ -1237,6 +1267,7 @@ pad_task (GstMseSrcPad * pad)
       if (!GST_CLOCK_TIME_IS_VALID (pad->pushed_end)
           || pts_end > pad->pushed_end) {
         pad->pushed_end = pts_end;
+        pad->pushed_duration = GST_BUFFER_DURATION (buffer);
       }
     }
 

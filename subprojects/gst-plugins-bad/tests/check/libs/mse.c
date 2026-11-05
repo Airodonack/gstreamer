@@ -2527,6 +2527,18 @@ new_pipeline_past_end (void)
   return pipeline;
 }
 
+/* Whether the media on a pad has caps whose name starts with `prefix`. */
+static gboolean
+pad_media_is (GstPad * pad, const gchar * prefix)
+{
+  GstCaps *caps = gst_pad_get_current_caps (pad);
+  gboolean result = caps && !gst_caps_is_empty (caps)
+      && g_str_has_prefix (gst_structure_get_name (gst_caps_get_structure
+          (caps, 0)), prefix);
+  gst_clear_caps (&caps);
+  return result;
+}
+
 /* Marks a buffer that msesrc pushed before the source reopened. */
 #define OLD_BUFFER_QUARK (g_quark_from_static_string ("mse-test-old-buffer"))
 
@@ -2547,6 +2559,9 @@ typedef struct
   GstClockTime old_end;
   guint old_after_eos[8];
   gboolean new_seen[8];
+  GstClockTime end[8];
+  GstClockTime end_duration[8];
+  gboolean video[8];
 } SinkFlow;
 
 static GstPadProbeReturn
@@ -2559,6 +2574,12 @@ count_sink_flow (GstPad * pad, GstPadProbeInfo * info, SinkFlow * flow)
     GstClockTime pts = GST_BUFFER_PTS (buffer);
     flow->marked_old[i] += gst_mini_object_get_qdata (GST_MINI_OBJECT (buffer),
         OLD_BUFFER_QUARK) != NULL;
+    GstClockTime end = pts + GST_BUFFER_DURATION (buffer);
+    if (flow->end[i] == 0 || end > flow->end[i]) {
+      flow->end[i] = end;
+      flow->end_duration[i] = GST_BUFFER_DURATION (buffer);
+    }
+    flow->video[i] = pad_media_is (pad, "video/");
     if (flow->buffers_after_eos[i]++ == 0) {
       flow->first_pts_after_eos[i] = pts;
     }
@@ -2903,13 +2924,7 @@ link_held_multiqueue (GstElement * src, GstPad * pad, HeldFlow * flow)
 static gboolean
 is_audio_or_video (GstPad * pad)
 {
-  GstCaps *caps = gst_pad_get_current_caps (pad);
-  const gchar *name = caps && !gst_caps_is_empty (caps) ?
-      gst_structure_get_name (gst_caps_get_structure (caps, 0)) : "";
-  gboolean result = g_str_has_prefix (name, "audio/")
-      || g_str_has_prefix (name, "video/");
-  gst_clear_caps (&caps);
-  return result;
+  return pad_media_is (pad, "audio/") || pad_media_is (pad, "video/");
 }
 
 /* Waits until every msesrc pad has pushed an EOS or its media, up to the
@@ -3119,11 +3134,23 @@ GST_START_TEST (test_media_source_element_holds_eos_until_end)
   fail_unless (gst_test_clock_peek_next_pending_id (clock, &id));
   GstClockTime first_wait = gst_clock_id_get_time (id);
   gst_clock_id_unref (id);
-  GstClockTime last_wait = gst_test_clock_id_list_get_latest_time (pending);
-  fail_unless (first_wait >= GST_SECOND && last_wait <= end,
-      "waiting from %" GST_TIME_FORMAT " to %" GST_TIME_FORMAT " for an end "
-      "at %" GST_TIME_FORMAT, GST_TIME_ARGS (first_wait),
-      GST_TIME_ARGS (last_wait), GST_TIME_ARGS (end));
+  fail_unless (first_wait >= GST_SECOND);
+  /* A video pad waits until 4 frames before the end of its media, so that
+   * the decoder drains its last frames in time; any other pad until the end
+   * itself. Each pad has pushed all of its media to its sink by now. */
+  g_mutex_lock (&flow.mutex);
+  for (guint i = 0; i < n_sinks; i++) {
+    GstClockTime expected = flow.video[i] ?
+        flow.end[i] - 4 * flow.end_duration[i] : flow.end[i];
+    gboolean found = FALSE;
+    for (GList * l = pending; l; l = l->next) {
+      found |= gst_clock_id_get_time (l->data) == expected;
+    }
+    fail_unless (found, "no clock wait at %" GST_TIME_FORMAT " for the %s "
+        "ending at %" GST_TIME_FORMAT, GST_TIME_ARGS (expected),
+        flow.video[i] ? "video" : "other track", GST_TIME_ARGS (flow.end[i]));
+  }
+  g_mutex_unlock (&flow.mutex);
   g_list_free_full (pending, (GDestroyNotify) gst_clock_id_unref);
   g_mutex_lock (&flow.mutex);
   for (guint i = 0; i < n_sinks; i++) {
