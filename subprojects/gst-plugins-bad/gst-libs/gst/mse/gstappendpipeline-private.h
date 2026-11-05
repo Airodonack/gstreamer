@@ -100,6 +100,9 @@ GST_MSE_PRIVATE
 gboolean gst_append_pipeline_get_eos (GstAppendPipeline * self);
 
 GST_MSE_PRIVATE
+GstStreamType gst_append_pipeline_stream_type_from_caps (GstCaps * caps);
+
+GST_MSE_PRIVATE
 void gst_append_pipeline_fail (GstAppendPipeline * self);
 
 GST_MSE_PRIVATE
