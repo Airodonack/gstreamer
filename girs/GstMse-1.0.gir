@@ -691,7 +691,10 @@ the track buffers for playback purposes.
       </method>
       <method name="change_content_type" c:identifier="gst_source_buffer_change_content_type" version="1.24" throws="1">
         <doc xml:space="preserve" filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c">Attempts to change the content type of @self to @type. Any new data appended
-to the Source Buffer must be of the supplied @type afterward.</doc>
+to the Source Buffer must be of the supplied @type afterward, starting with
+an initialization segment.
+
+[Specification](https://www.w3.org/TR/media-source-2/#dom-sourcebuffer-changetype)</doc>
         <source-position filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.h"/>
         <return-value transfer-ownership="none">
           <doc xml:space="preserve" filename="../subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c">`TRUE` on success, `FALSE` otherwise</doc>
