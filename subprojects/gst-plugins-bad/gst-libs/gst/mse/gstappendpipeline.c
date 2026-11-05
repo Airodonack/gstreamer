@@ -91,6 +91,15 @@ struct _GstAppendPipeline
 
   GstPipeline *pipeline;
   GstAppSrc *src;
+  /* The caps the parser starts from: set by gst_append_pipeline_set_caps(),
+   * taken by the next reset when the source has others. */
+  GstCaps *caps;
+  /* Guards src and caps. A reset replaces src, and changeType() sets the
+   * caps from the application's thread, while the append task may be
+   * pushing into src or another thread resetting: each takes a reference
+   * to src under the lock and uses it after. Never held while calling
+   * out. */
+  GMutex src_lock;
   GstElement *parsebin;
   GstBus *bus;
 
@@ -1114,18 +1123,33 @@ background_task_cleanup (gpointer ptr)
   g_free (task);
 }
 
-static void
-gst_append_pipeline_init (GstAppendPipeline * self)
+static GstAppSrc *
+get_src (GstAppendPipeline * self)
+{
+  g_mutex_lock (&self->src_lock);
+  GstAppSrc *src = gst_object_ref (self->src);
+  g_mutex_unlock (&self->src_lock);
+  return src;
+}
+
+static GstElement *
+new_appsrc (GstAppendPipeline * self)
 {
   GstElement *appsrc = GST_ELEMENT (gst_element_factory_make ("appsrc", "src"));
-  GstElement *parsebin =
-      GST_ELEMENT (gst_element_factory_make ("parsebin", "parse"));
-  GstElement *pipeline = gst_pipeline_new ("append-pipeline");
-
   GstPad *appsrc_pad = GST_PAD (gst_element_get_static_pad (appsrc, "src"));
   gst_pad_add_probe (appsrc_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
       event_probe, self, NULL);
   gst_object_unref (appsrc_pad);
+  return appsrc;
+}
+
+static void
+gst_append_pipeline_init (GstAppendPipeline * self)
+{
+  GstElement *appsrc = new_appsrc (self);
+  GstElement *parsebin =
+      GST_ELEMENT (gst_element_factory_make ("parsebin", "parse"));
+  GstElement *pipeline = gst_pipeline_new ("append-pipeline");
 
   gst_bin_add_many (GST_BIN (pipeline), appsrc, parsebin, NULL);
   if (!gst_element_link (appsrc, parsebin)) {
@@ -1135,6 +1159,7 @@ gst_append_pipeline_init (GstAppendPipeline * self)
   self->bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
   self->pipeline = gst_object_ref_sink (GST_PIPELINE (pipeline));
   self->src = GST_APP_SRC (appsrc);
+  g_mutex_init (&self->src_lock);
   self->parsebin = parsebin;
 
   self->task = background_task_new (self);
@@ -1180,6 +1205,7 @@ gst_append_pipeline_finalize (GObject * object)
 
   gst_clear_object (&self->pipeline);
   gst_clear_object (&self->bus);
+  gst_clear_caps (&self->caps);
 
   init_segment_finalize (&self->init_segment);
 
@@ -1189,6 +1215,7 @@ gst_append_pipeline_finalize (GObject * object)
   gst_clear_object (&self->reported_streams);
 
   g_mutex_clear (&self->init_segment_lock);
+  g_mutex_clear (&self->src_lock);
   g_mutex_clear (&self->appends_lock);
   g_cond_clear (&self->appends_cond);
 
@@ -1238,33 +1265,91 @@ error:
 }
 
 /* Tells the parser what the appended bytes are, so it does not have to
- * typefind them first. */
+ * typefind them first; %NULL caps make it typefind. A source that has no
+ * caps yet takes them at once. One that has other caps keeps them until the
+ * next reset: appsrc cannot go back to no caps, and after a restart it
+ * announces the caps it last pushed before any queued ones, which would make
+ * parsebin pick the old type's demuxer. */
 void
 gst_append_pipeline_set_caps (GstAppendPipeline * self, GstCaps * caps)
 {
   g_return_if_fail (GST_IS_APPEND_PIPELINE (self));
-  gst_app_src_set_caps (self->src, caps);
+  g_mutex_lock (&self->src_lock);
+  gst_caps_replace (&self->caps, caps);
+  GstAppSrc *src = gst_object_ref (self->src);
+  g_mutex_unlock (&self->src_lock);
+  GstCaps *src_caps = gst_app_src_get_caps (src);
+  if (src_caps == NULL && caps != NULL) {
+    gst_app_src_set_caps (src, caps);
+  }
+  gst_clear_caps (&src_caps);
+  gst_object_unref (src);
+}
+
+/* Replaces the stopped pipeline's source with a new one when its caps are
+ * not the ones last set. */
+static void
+renew_appsrc_if_needed (GstAppendPipeline * self)
+{
+  g_mutex_lock (&self->src_lock);
+  GstCaps *caps = self->caps != NULL ? gst_caps_ref (self->caps) : NULL;
+  GstElement *old_appsrc = gst_object_ref (GST_ELEMENT (self->src));
+  g_mutex_unlock (&self->src_lock);
+
+  GstCaps *src_caps = gst_app_src_get_caps (GST_APP_SRC (old_appsrc));
+  gboolean same = src_caps == caps || (src_caps != NULL && caps != NULL
+      && gst_caps_is_equal (src_caps, caps));
+  gst_clear_caps (&src_caps);
+  if (same) {
+    goto done;
+  }
+
+  GST_DEBUG_OBJECT (self, "new source for caps %" GST_PTR_FORMAT, caps);
+  /* Until the new source is in place, a holder of the old one pushes into
+   * a stopped source and gets GST_FLOW_FLUSHING. */
+  gst_element_set_state (old_appsrc, GST_STATE_NULL);
+  gst_bin_remove (GST_BIN (self->pipeline), old_appsrc);
+
+  GstElement *appsrc = new_appsrc (self);
+  gst_bin_add (GST_BIN (self->pipeline), appsrc);
+  if (!gst_element_link (appsrc, self->parsebin)) {
+    g_error ("failed to link appsrc to parsebin");
+  }
+  if (caps != NULL) {
+    gst_app_src_set_caps (GST_APP_SRC (appsrc), caps);
+  }
+  g_mutex_lock (&self->src_lock);
+  self->src = GST_APP_SRC (appsrc);
+  g_mutex_unlock (&self->src_lock);
+
+done:
+  gst_object_unref (old_appsrc);
+  gst_clear_caps (&caps);
 }
 
 GstFlowReturn
 gst_append_pipeline_append (GstAppendPipeline * self, GstBuffer * buffer)
 {
   g_return_val_if_fail (GST_IS_APPEND_PIPELINE (self), GST_FLOW_ERROR);
-  GstFlowReturn push_result = gst_app_src_push_buffer (self->src, buffer);
+  GstAppSrc *src = get_src (self);
+  GstFlowReturn push_result = gst_app_src_push_buffer (src, buffer);
   if (push_result != GST_FLOW_OK)
-    return push_result;
+    goto done;
 
   g_mutex_lock (&self->appends_lock);
   self->appends_in_flight++;
   g_mutex_unlock (&self->appends_lock);
 
-  if (!gst_element_send_event (GST_ELEMENT_CAST (self->src),
+  if (!gst_element_send_event (GST_ELEMENT_CAST (src),
           new_end_of_append_event ())) {
     GST_ERROR_OBJECT (self, "failed to push end-of-append event");
     appends_done (self, FALSE);
-    return GST_FLOW_ERROR;
+    push_result = GST_FLOW_ERROR;
   }
-  return GST_FLOW_OK;
+
+done:
+  gst_object_unref (src);
+  return push_result;
 }
 
 /* Blocks until every buffer given to gst_append_pipeline_append() has been
@@ -1286,7 +1371,10 @@ GstFlowReturn
 gst_append_pipeline_eos (GstAppendPipeline * self)
 {
   g_return_val_if_fail (GST_IS_APPEND_PIPELINE (self), GST_FLOW_ERROR);
-  return gst_app_src_end_of_stream (self->src);
+  GstAppSrc *src = get_src (self);
+  GstFlowReturn result = gst_app_src_end_of_stream (src);
+  gst_object_unref (src);
+  return result;
 }
 
 gboolean
@@ -1327,6 +1415,8 @@ gst_append_pipeline_reset (GstAppendPipeline * self)
   }
 
   background_task_stop (self->task);
+
+  renew_appsrc_if_needed (self);
 
   /* The appsinks of the old tracks stay in the pipeline otherwise, and the
    * next init segment's appsink of the same name cannot be added, so its
