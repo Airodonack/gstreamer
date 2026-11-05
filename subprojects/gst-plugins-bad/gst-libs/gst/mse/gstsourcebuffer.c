@@ -240,6 +240,7 @@ static void call_active_state_changed (GstSourceBuffer * self);
 static GArray *get_buffered_unlocked (GstSourceBuffer * self);
 static inline gboolean is_removed_unlocked (GstSourceBuffer * self);
 static void append_error_unlocked (GstSourceBuffer * self);
+static void reset_parser_state (GstSourceBuffer * self);
 
 static void seek_track_buffer_unlocked (GstMediaSourceTrack * track,
     GstMediaSourceTrackBuffer * buffer, GstSourceBuffer * self);
@@ -1687,7 +1688,10 @@ gst_source_buffer_get_content_type (GstSourceBuffer * self)
  * @error: (out) (optional) (nullable) (transfer full): the resulting error or `NULL`
  *
  * Attempts to change the content type of @self to @type. Any new data appended
- * to the Source Buffer must be of the supplied @type afterward.
+ * to the Source Buffer must be of the supplied @type afterward, starting with
+ * an initialization segment.
+ *
+ * [Specification](https://www.w3.org/TR/media-source-2/#dom-sourcebuffer-changetype)
  *
  * Returns: `TRUE` on success, `FALSE` otherwise
  * Since: 1.24
@@ -1705,6 +1709,8 @@ gst_source_buffer_change_content_type (GstSourceBuffer * self,
     return FALSE;
   }
 
+  gboolean supported = gst_media_source_is_type_supported (type);
+
   GST_OBJECT_LOCK (self);
 
   if (is_removed_unlocked (self)) {
@@ -1721,9 +1727,54 @@ gst_source_buffer_change_content_type (GstSourceBuffer * self,
     goto error;
   }
 
-  g_set_error (error,
-      GST_MEDIA_SOURCE_ERROR, GST_MEDIA_SOURCE_ERROR_NOT_SUPPORTED,
-      "content type cannot be changed");
+  if (!supported) {
+    g_set_error (error,
+        GST_MEDIA_SOURCE_ERROR, GST_MEDIA_SOURCE_ERROR_NOT_SUPPORTED,
+        "content type %s is not supported", type);
+    goto error;
+  }
+
+  if (is_ended_unlocked (self)) {
+    open_parent_unlocked (self);
+  }
+
+  GstMediaSourceMediaType media_type = GST_MEDIA_SOURCE_MEDIA_TYPE_INIT;
+  gst_media_source_media_type_parse (&media_type, type);
+  gboolean generate_timestamps = gst_media_source_media_type_generates_timestamp
+      (&media_type);
+  GstCaps *caps = gst_media_source_media_type_get_caps (&media_type);
+  gst_media_source_media_type_reset (&media_type);
+
+  /* The generate timestamps flag follows the new byte stream format. When it
+   * is set the mode becomes sequence; otherwise the spec keeps the previous
+   * mode, even if the old format had forced sequence. */
+  self->generate_timestamps = generate_timestamps;
+  gboolean mode_changed = generate_timestamps
+      && self->append_mode != GST_SOURCE_BUFFER_APPEND_MODE_SEQUENCE;
+  if (generate_timestamps) {
+    self->append_mode = GST_SOURCE_BUFFER_APPEND_MODE_SEQUENCE;
+  }
+  g_free (self->content_type);
+  self->content_type = g_strdup (type);
+
+  GST_OBJECT_UNLOCK (self);
+
+  /* As in gst_source_buffer_new(), the caps tell the parser what the bytes
+   * are when the type is enough to know, and no caps let it typefind them.
+   * The parser takes them when the reset restarts it. After the reset it
+   * needs an initialization segment before it hands out any media, which is
+   * what the spec's pending initialization segment for changeType flag asks
+   * for. */
+  gst_append_pipeline_set_caps (self->append_pipeline, caps);
+  gst_clear_caps (&caps);
+  reset_parser_state (self);
+
+  if (mode_changed) {
+    g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_APPEND_MODE]);
+  }
+  g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_CONTENT_TYPE]);
+
+  return TRUE;
 
 error:
   GST_OBJECT_UNLOCK (self);
