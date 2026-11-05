@@ -69,6 +69,11 @@
 #define DECODE_ERROR "decode error"
 #define NETWORK_ERROR "network error"
 
+/* How long before playback reaches the end of a track a pad sends its EOS,
+ * so that the EOS gets through the queues and lets the decoder drain before
+ * the sink runs out of media. */
+#define EOS_HOLD_MARGIN (200 * GST_MSECOND)
+
 enum
 {
   PROP_0,
@@ -125,6 +130,13 @@ struct _GstMseSrcPad
   GCond linked_or_flushing_cond;
   GMutex linked_or_flushing_lock;
   gboolean flushing;
+
+  /* The end of the media pushed since the last segment, and the wait for
+   * playback to reach it before the EOS is pushed, see hold_eos(). */
+  GstClockTime pushed_end;
+  GMutex eos_hold_lock;
+  GCond eos_hold_cond;
+  GstClockID eos_hold_id;
 };
 
 #define MEDIA_SOURCE_LOCK(a) g_mutex_lock (&(a)->media_source_lock)
@@ -138,6 +150,9 @@ struct _GstMseSrcPad
 #define LINKED_OR_FLUSHING_SIGNAL(a) (g_cond_signal (&a->linked_or_flushing_cond))
 #define LINKED_OR_FLUSHING_WAIT(a) \
   (g_cond_wait (&a->linked_or_flushing_cond, &a->linked_or_flushing_lock))
+
+#define EOS_HOLD_LOCK(a) (g_mutex_lock (&a->eos_hold_lock))
+#define EOS_HOLD_UNLOCK(a) (g_mutex_unlock (&a->eos_hold_lock))
 
 #define FLOW_COMBINER_LOCK(a) (g_mutex_lock (&a->flow_combiner_lock))
 #define FLOW_COMBINER_UNLOCK(a) (g_mutex_unlock (&a->flow_combiner_lock))
@@ -154,6 +169,7 @@ static gboolean pad_event (GstMseSrcPad * pad, GstMseSrc * parent,
 static gboolean pad_query (GstMseSrcPad * pad, GstObject * parent,
     GstQuery * query);
 static void pad_task (GstMseSrcPad * pad);
+static void wake_eos_hold (GstMseSrcPad * pad);
 
 static ReadyStateUpdateTask *ready_state_update_task_new (GstMseSrc * parent);
 static void ready_state_update_task_free (ReadyStateUpdateTask * task);
@@ -180,6 +196,8 @@ gst_mse_src_pad_new (GstMediaSourceTrack * track, GstStream * stream,
   self->track = track;
   self->segment.start = start;
   self->segment.rate = rate;
+  g_signal_connect_object (track, "on-not-empty",
+      G_CALLBACK (wake_eos_hold), self, G_CONNECT_SWAPPED);
 
   return GST_PAD (self);
 }
@@ -195,6 +213,10 @@ gst_mse_src_pad_init (GstMseSrcPad * self)
   self->flushing = FALSE;
   g_mutex_init (&self->linked_or_flushing_lock);
   g_cond_init (&self->linked_or_flushing_cond);
+  self->pushed_end = GST_CLOCK_TIME_NONE;
+  g_mutex_init (&self->eos_hold_lock);
+  g_cond_init (&self->eos_hold_cond);
+  self->eos_hold_id = NULL;
 
   gst_pad_set_activatemode_function (GST_PAD (self),
       (GstPadActivateModeFunction) pad_activate_mode);
@@ -211,6 +233,8 @@ gst_mse_src_pad_finalize (GObject * object)
   gst_clear_caps (&self->most_recent_caps);
   g_mutex_clear (&self->linked_or_flushing_lock);
   g_cond_clear (&self->linked_or_flushing_cond);
+  g_mutex_clear (&self->eos_hold_lock);
+  g_cond_clear (&self->eos_hold_cond);
 
   G_OBJECT_CLASS (gst_mse_src_pad_parent_class)->finalize (object);
 }
@@ -257,6 +281,9 @@ struct _GstMseSrc
 
   GstFlowCombiner *flow_combiner;
   GMutex flow_combiner_lock;
+
+  /* Whether running time goes on, which the pads' EOS waits for. */
+  gint playing;
 
   gchar *uri;
 };
@@ -771,6 +798,7 @@ set_flushing_and_signal (GstMseSrcPad * pad)
   g_atomic_int_set (&pad->flushing, TRUE);
   LINKED_OR_FLUSHING_SIGNAL (pad);
   LINKED_OR_FLUSHING_UNLOCK (pad);
+  wake_eos_hold (pad);
   GST_TRACE_OBJECT (pad, "done");
 }
 
@@ -814,6 +842,7 @@ flush_stream (GstMseSrc * self, Stream * stream, gboolean is_seek)
   }
 
   g_atomic_int_set (&pad->does_need_segment, TRUE);
+  pad->pushed_end = GST_CLOCK_TIME_NONE;
 
   gst_pad_push_event (GST_PAD (pad), gst_event_new_flush_stop (is_seek));
 }
@@ -876,6 +905,13 @@ tear_down_all_streams (GstMseSrc * self)
   }
 }
 
+static gboolean
+wake_eos_hold_func (GstElement * element, GstPad * pad, gpointer user_data)
+{
+  wake_eos_hold (GST_MSE_SRC_PAD (pad));
+  return TRUE;
+}
+
 static GstStateChangeReturn
 gst_mse_src_change_state (GstElement * element, GstStateChange transition)
 {
@@ -891,6 +927,15 @@ gst_mse_src_change_state (GstElement * element, GstStateChange transition)
       break;
     case GST_STATE_CHANGE_READY_TO_PAUSED:
       ready_state_update_task_start (self->ready_state_update_task);
+      break;
+    case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
+      /* The bin has set the clock and the base time by now. */
+      g_atomic_int_set (&self->playing, TRUE);
+      gst_element_foreach_src_pad (element, wake_eos_hold_func, NULL);
+      break;
+    case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
+      g_atomic_int_set (&self->playing, FALSE);
+      gst_element_foreach_src_pad (element, wake_eos_hold_func, NULL);
       break;
     default:
       break;
@@ -969,6 +1014,95 @@ await_pad_linked_or_flushing (GstMseSrcPad * pad)
   LINKED_OR_FLUSHING_UNLOCK (pad);
   GST_TRACE_OBJECT (pad, "linked");
   return flushing;
+}
+
+/* Wakes the pad's wait for playback to reach the end of its track: new
+ * media came, the pad is flushing, or running time started or stopped. */
+static void
+wake_eos_hold (GstMseSrcPad * pad)
+{
+  EOS_HOLD_LOCK (pad);
+  if (pad->eos_hold_id) {
+    gst_clock_id_unschedule (pad->eos_hold_id);
+  }
+  g_cond_signal (&pad->eos_hold_cond);
+  EOS_HOLD_UNLOCK (pad);
+}
+
+typedef enum
+{
+  EOS_HOLD_REACHED,
+  EOS_HOLD_REOPENED,
+  EOS_HOLD_FLUSHING,
+} EosHoldResult;
+
+/* An end of stream in MSE can be taken back: an append reopens the source
+ * (prepare append step 5), and playback goes on into the new media without
+ * ever reaching the old end. An EOS in GStreamer is final for the stream and
+ * downstream acts on it as soon as it gets it, while the media before it is
+ * still queued. So the EOS a track ends with is held here until running
+ * time comes within EOS_HOLD_MARGIN of the end of the media pushed, as a
+ * browser tells its decoder of the end only when playback gets there. New
+ * media on the track meanwhile means the source reopened: the EOS is
+ * dropped and the media follows the old with nothing between them. While
+ * the element is not PLAYING running time stands still, and so does the
+ * wait. With no clock the sinks do not wait either, and nor does the EOS.
+ * No lock is held across the clock wait; the clock and base time are read
+ * under the pad's hold lock, which only wake_eos_hold() takes elsewhere. */
+static EosHoldResult
+hold_eos (GstMseSrcPad * pad, GstMseSrc * self)
+{
+  EosHoldResult result;
+  gboolean reached = FALSE;
+
+  EOS_HOLD_LOCK (pad);
+  while (TRUE) {
+    if (is_flushing (pad)) {
+      result = EOS_HOLD_FLUSHING;
+      break;
+    }
+    if (!gst_media_source_track_is_empty (pad->track)) {
+      result = EOS_HOLD_REOPENED;
+      break;
+    }
+    if (reached) {
+      result = EOS_HOLD_REACHED;
+      break;
+    }
+    if (!g_atomic_int_get (&self->playing)) {
+      GST_DEBUG_OBJECT (pad, "holding EOS until playing");
+      g_cond_wait (&pad->eos_hold_cond, &pad->eos_hold_lock);
+      continue;
+    }
+
+    GstClock *clock = gst_element_get_clock (GST_ELEMENT (self));
+    GstClockTime end = gst_segment_to_running_time (&pad->segment,
+        GST_FORMAT_TIME, pad->pushed_end);
+    if (clock == NULL || !GST_CLOCK_TIME_IS_VALID (end)) {
+      gst_clear_object (&clock);
+      reached = TRUE;
+      continue;
+    }
+    GstClockTime base_time = gst_element_get_base_time (GST_ELEMENT (self));
+    GstClockTime target = base_time + (end > EOS_HOLD_MARGIN ?
+        end - EOS_HOLD_MARGIN : 0);
+    GST_DEBUG_OBJECT (pad, "holding EOS until running time %"
+        GST_TIMEP_FORMAT, &end);
+    GstClockID id = gst_clock_new_single_shot_id (clock, target);
+    gst_object_unref (clock);
+    pad->eos_hold_id = id;
+    EOS_HOLD_UNLOCK (pad);
+
+    GstClockReturn ret = gst_clock_id_wait (id, NULL);
+
+    EOS_HOLD_LOCK (pad);
+    pad->eos_hold_id = NULL;
+    gst_clock_id_unref (id);
+    /* Unscheduled: look again at what woke it. */
+    reached = ret != GST_CLOCK_UNSCHEDULED;
+  }
+  EOS_HOLD_UNLOCK (pad);
+  return result;
 }
 
 static void
@@ -1096,6 +1230,15 @@ pad_task (GstMseSrcPad * pad)
       GstClockTime buffer_end = GST_BUFFER_DTS (buffer) + duration;
       pad->segment.position = MAX (pad->segment.position, buffer_end);
     }
+    if (GST_BUFFER_PTS_IS_VALID (buffer)) {
+      GstClockTime pts_end = GST_BUFFER_PTS (buffer) +
+          (GST_BUFFER_DURATION_IS_VALID (buffer) ?
+          GST_BUFFER_DURATION (buffer) : 0);
+      if (!GST_CLOCK_TIME_IS_VALID (pad->pushed_end)
+          || pts_end > pad->pushed_end) {
+        pad->pushed_end = pts_end;
+      }
+    }
 
     GstFlowReturn push_result = gst_pad_push (GST_PAD (pad), buffer);
 
@@ -1120,7 +1263,19 @@ pad_task (GstMseSrcPad * pad)
   } else if (GST_IS_EVENT (object)) {
     GstEvent *event = GST_EVENT (g_steal_pointer (&object));
     if (GST_EVENT_TYPE (event) == GST_EVENT_EOS) {
-      GST_LOG_OBJECT (self, "EOS");
+      switch (hold_eos (pad, self)) {
+        case EOS_HOLD_REACHED:
+          GST_LOG_OBJECT (pad, "EOS");
+          break;
+        case EOS_HOLD_REOPENED:
+          GST_DEBUG_OBJECT (pad, "more media before the end, dropping EOS");
+          gst_event_unref (event);
+          gst_clear_object (&self);
+          return;
+        case EOS_HOLD_FLUSHING:
+          gst_event_unref (event);
+          goto pause;
+      }
     }
     if (!gst_pad_push_event (GST_PAD (pad), event)) {
       GST_ERROR_OBJECT (self, "failed to push enqueued event");
