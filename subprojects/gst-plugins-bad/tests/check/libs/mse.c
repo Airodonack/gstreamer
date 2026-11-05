@@ -1720,6 +1720,81 @@ GST_START_TEST (test_source_buffer_change_content_type)
 
 GST_END_TEST;
 
+/* Appends a whole test file to the source buffer and checks that it parsed
+ * without error, leaving n_ranges buffered ranges. */
+static void
+append_test_file_and_check (GstSourceBuffer * source_buffer,
+    SourceBufferEvents * events, const gchar * name, guint update_end,
+    guint n_ranges)
+{
+  GError *error = NULL;
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_file_buffer (name), &error));
+  g_assert_no_error (error);
+  await_update_end (events, update_end);
+  fail_unless_equals_int (events->error, 0);
+
+  GArray *buffered = gst_source_buffer_get_buffered (source_buffer, &error);
+  g_assert_no_error (error);
+  fail_unless_equals_int (buffered->len, n_ranges);
+  g_array_unref (buffered);
+}
+
+GST_START_TEST (test_source_buffer_init_segment_other_tracks)
+{
+  /* Proves a later initialization segment needs the tracks of the first:
+   * mse.mp4 has video, audio and text, the one appended after a reset only
+   * video and audio, so the append fails. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  append_test_file_and_check (source_buffer, &events, "mse.mp4", 1, 1);
+  fail_unless (gst_source_buffer_abort (source_buffer, &error));
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_file_buffer ("mse-h264-aac-init.mp4"), &error));
+  g_assert_no_error (error);
+  await_error (&events, 1);
+  await_update_end (&events, 2);
+
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_source_buffer_init_segment_new_track_id)
+{
+  /* Proves a later initialization segment whose only video track has
+   * another track ID is accepted: MSE asks the track IDs to match only
+   * when a type has more than one track. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          with_video_track_5 (test_mp4_buffer ()), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 2);
+  fail_unless_equals_int (events.error, 0);
+
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
 /* Tells, from any thread, whether a watched object has been disposed. */
 typedef struct
 {
@@ -1955,6 +2030,45 @@ GST_START_TEST (test_source_buffer_append_after_abort)
   g_assert_no_error (error);
   await_update_end (&events, 1);
 
+  fail_unless (gst_source_buffer_abort (source_buffer, &error));
+  g_assert_no_error (error);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 2);
+  fail_unless_equals_int (events.error, 0);
+
+  GArray *buffered = gst_source_buffer_get_buffered (source_buffer, &error);
+  g_assert_no_error (error);
+  fail_unless_equals_int (buffered->len, 1);
+  g_array_unref (buffered);
+
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_source_buffer_append_after_two_aborts)
+{
+  /* Proves two aborts in a row, with no initialization segment between
+   * them, still give the next one the tracks of the first: the media lands
+   * in the track buffers and feeds the source buffer has, which are keyed
+   * by the track objects. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_buffer (), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+
+  fail_unless (gst_source_buffer_abort (source_buffer, &error));
+  g_assert_no_error (error);
   fail_unless (gst_source_buffer_abort (source_buffer, &error));
   g_assert_no_error (error);
   fail_unless (gst_source_buffer_append_buffer (source_buffer,
@@ -4034,6 +4148,8 @@ mse_suite (void)
         test_source_buffer_buffered_at_update_end);
     tcase_add_test (tc_source_buffer, test_source_buffer_append_after_abort);
     tcase_add_test (tc_source_buffer,
+        test_source_buffer_append_after_two_aborts);
+    tcase_add_test (tc_source_buffer,
         test_source_buffer_negative_timestamp_offset_sequence);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_timestamp_offset_segments);
@@ -4046,6 +4162,10 @@ mse_suite (void)
         test_source_buffer_init_segment_alone_activates);
     tcase_add_test (tc_source_buffer,
         test_source_buffer_tracks_from_init_segment);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_init_segment_other_tracks);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_init_segment_new_track_id);
   }
 
   tcase_add_test (tc_append_pipeline, test_append_pipeline_create_and_free);
