@@ -897,6 +897,15 @@ error:
   return NULL;
 }
 
+/* Tells the parser what the appended bytes are, so it does not have to
+ * typefind them first. */
+void
+gst_append_pipeline_set_caps (GstAppendPipeline * self, GstCaps * caps)
+{
+  g_return_if_fail (GST_IS_APPEND_PIPELINE (self));
+  gst_app_src_set_caps (self->src, caps);
+}
+
 GstFlowReturn
 gst_append_pipeline_append (GstAppendPipeline * self, GstBuffer * buffer)
 {

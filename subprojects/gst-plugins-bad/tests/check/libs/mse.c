@@ -259,6 +259,16 @@ await_update_end (SourceBufferEvents * events, guint count)
   g_mutex_unlock (&events->mutex);
 }
 
+static guint
+n_active_source_buffers (GstMediaSource * media_source)
+{
+  GstSourceBufferList *active_buffers =
+      gst_media_source_get_active_source_buffers (media_source);
+  guint n = gst_source_buffer_list_get_length (active_buffers);
+  gst_object_unref (active_buffers);
+  return n;
+}
+
 /* Waits until the source buffer has emitted error count times. */
 static void
 await_error (SourceBufferEvents * events, guint count)
@@ -1536,6 +1546,32 @@ GST_START_TEST (test_source_buffer_remove_reopens_ended_source)
 
 GST_END_TEST;
 
+GST_START_TEST (test_source_buffer_init_segment_alone_activates)
+{
+  /* Proves an MP4 initialization segment on its own gives the source
+   * buffer its tracks, so that it joins the active source buffers by the
+   * time its append ends: here H.264 and AAC, whose parsers have caps from
+   * the sample descriptions. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_file_buffer ("mse-h264-aac-init.mp4"), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+  fail_unless_equals_int (events.error, 0);
+  fail_unless_equals_int (n_active_source_buffers (media_source), 1);
+
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_source_buffer_removed_in_event_handler)
 {
   /* Proves a source buffer can be removed, and lose its last reference,
@@ -2128,6 +2164,8 @@ mse_suite (void)
     tcase_add_test (tc_source_buffer,
         test_source_buffer_parse_error_reported_once);
     tcase_add_test (tc_source_buffer, test_source_buffer_remove_range);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_init_segment_alone_activates);
   }
 
   tcase_add_test (tc_append_pipeline, test_append_pipeline_create_and_free);
