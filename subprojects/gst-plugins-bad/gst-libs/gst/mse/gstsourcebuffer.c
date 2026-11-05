@@ -954,7 +954,9 @@ on_new_sample (GstAppendPipeline * pipeline, GstMediaSourceTrack * track,
   GST_OBJECT_UNLOCK (self);
 
   TRACKS_LOCK (self);
-  if (is_within_window) {
+  /* A track the first initialization segment did not have is refused in
+   * on_received_init_segment(); its samples have no track buffer. */
+  if (is_within_window && g_hash_table_contains (self->track_buffers, track)) {
     GstMediaSourceTrackBuffer *track_buffer =
         get_track_buffer_unlocked (self, track);
     GST_TRACE_OBJECT (self, "new sample on %s with %" GST_PTR_FORMAT,
@@ -1062,6 +1064,22 @@ track_collections_equal (GstStreamCollection * a, GstStreamCollection * b)
   return TRUE;
 }
 
+/* Whether the tracks of the current initialization segment are the ones of
+ * the first: the append pipeline hands back the same track objects for the
+ * same type and position, so a track buffer exists for each of them. */
+static gboolean
+has_first_init_segment_tracks_unlocked (GstSourceBuffer * self)
+{
+  GPtrArray *tracks = gst_source_buffer_get_all_tracks (self);
+  gboolean matches = tracks->len == g_hash_table_size (self->track_buffers);
+  for (guint i = 0; matches && i < tracks->len; i++) {
+    matches = g_hash_table_contains (self->track_buffers,
+        g_ptr_array_index (tracks, i));
+  }
+  g_ptr_array_unref (tracks);
+  return matches;
+}
+
 static void
 on_received_init_segment (GstAppendPipeline * pipeline, gpointer user_data)
 {
@@ -1070,6 +1088,21 @@ on_received_init_segment (GstAppendPipeline * pipeline, gpointer user_data)
       GST_TIME_ARGS (gst_append_pipeline_get_duration (pipeline)));
 
   TRACKS_LOCK (self);
+
+  if (g_atomic_int_get (&self->processed_init_segment)
+      && !has_first_init_segment_tracks_unlocked (self)) {
+    /* MSE, Initialization Segment Received, step 3: "The number of audio,
+     * video, and text tracks match what was in the first initialization
+     * segment", or the append error algorithm runs; for example a later
+     * initialization segment with fewer tracks. As in on_error(), the
+     * append task reports the error; the samples of the new tracks are
+     * dropped. */
+    GST_ERROR_OBJECT (self, "initialization segment does not have the tracks "
+        "of the first");
+    TRACKS_UNLOCK (self);
+    g_atomic_int_set (&self->append_failed, TRUE);
+    return;
+  }
 
   if (g_atomic_int_compare_and_exchange (&self->processed_init_segment, FALSE,
           TRUE)) {
