@@ -37,6 +37,7 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
+#include <gst/pbutils/pbutils.h>
 
 typedef enum
 {
@@ -62,10 +63,17 @@ typedef struct
 typedef struct
 {
   GstAppendPipeline *parent;
+  /* The stream-id of the demuxer pad, or of parsebin's pad when there is no
+   * demuxer. Parsers pass the demuxer's stream-start on, so parsebin's pad
+   * for this track has the same id. */
+  gchar *stream_id;
+  /* parsebin's pad, and the stream parsebin made for it: NULL until
+   * parsebin exposes the pad, which for a track known from the demuxer can
+   * be after its initialization segment was reported. */
   GstPad *src_pad;
+  GstStream *stream;
   GstAppSink *sink;
   GstMediaSourceTrack *mse_track;
-  GstStream *stream;
   GstClockTime previous_pts;
 } Track;
 
@@ -85,6 +93,14 @@ struct _GstAppendPipeline
   GstAppSrc *src;
   GstElement *parsebin;
   GstBus *bus;
+
+  /* Set once parsebin plugs a container demuxer. The demuxer's pads, which
+   * it adds as it parses the initialization segment, then give the tracks,
+   * and its no-more-pads reports the initialization segment. parsebin
+   * exposes a pad only once the parser behind it has caps and a stream-id,
+   * which some parsers take from the first frame, so its pads only carry
+   * the samples. */
+  gboolean have_demuxer;
 
   GstStreamCollection *streams;
   /* The collection the last init segment report was made for. The report
@@ -491,26 +507,19 @@ error:
   return GST_PAD_PROBE_HANDLED;
 }
 
+/* Whether a stream of this type and caps can be a track: IGNORED for a type
+ * MSE has no track for, PARSE_ERROR for caps no element can take. */
 static AddTrackResult
-add_track (GstAppendPipeline * self, GstPad * pad, GstStream * stream,
-    GstCaps * caps, Track * added_track)
+check_track (GstAppendPipeline * self, GstStreamType type, GstCaps * caps)
 {
-  GstStreamType type = gst_stream_get_stream_type (stream);
-  GstMediaSourceTrackType track_type =
-      gst_media_source_track_type_from_stream_type (type);
-
   switch (type) {
     case GST_STREAM_TYPE_AUDIO:
     case GST_STREAM_TYPE_TEXT:
     case GST_STREAM_TYPE_VIDEO:
       break;
-    default:{
-      GST_DEBUG_OBJECT (self, "unexpected caps %" GST_PTR_FORMAT
-          ", using black hole probe", caps);
-      gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, black_hole_probe, self,
-          NULL);
+    default:
+      GST_DEBUG_OBJECT (self, "no track for caps %" GST_PTR_FORMAT, caps);
       return IGNORED;
-    }
   }
 
   if (type != GST_STREAM_TYPE_TEXT &&
@@ -519,41 +528,84 @@ add_track (GstAppendPipeline * self, GstPad * pad, GstStream * stream,
     return PARSE_ERROR;
   }
 
+  return ADDED;
+}
+
+/* Adds a track with its appsink, not linked yet. The returned pointer is
+ * valid until the next track is added. */
+static Track *
+append_track (GstAppendPipeline * self, GstStreamType type,
+    const gchar * stream_id, GstCaps * caps)
+{
+  GstMediaSourceTrackType track_type =
+      gst_media_source_track_type_from_stream_type (type);
+
   GstAppSink *appsink = new_appsink (self, type);
   gst_bin_add (GST_BIN (self->pipeline), GST_ELEMENT (appsink));
   gst_element_sync_state_with_parent (GST_ELEMENT (appsink));
 
-  GstPad *appsink_pad =
-      gst_element_get_static_pad (GST_ELEMENT (appsink), "sink");
-  GstPadLinkReturn link_result = gst_pad_link (pad, appsink_pad);
-  gst_clear_object (&appsink_pad);
-  if (GST_PAD_LINK_FAILED (link_result)) {
-    g_error ("failed to link parser to appsink: %s",
-        gst_pad_link_get_name (link_result));
-  }
-
   Track track_template = {
     .parent = self,
+    .stream_id = g_strdup (stream_id),
     .sink = gst_object_ref (appsink),
-    .src_pad = gst_object_ref (pad),
-    .stream = gst_object_ref (stream),
     .mse_track = reuse_or_new_track (self, track_type,
         GST_OBJECT_NAME (appsink), caps),
     .previous_pts = GST_CLOCK_TIME_NONE,
   };
   g_array_append_val (self->tracks, track_template);
 
-  GST_TRACE_OBJECT (self, "added appsink %s to pad %s",
-      GST_OBJECT_NAME (appsink), GST_OBJECT_NAME (pad));
+  GST_TRACE_OBJECT (self, "added appsink %s for stream %s",
+      GST_OBJECT_NAME (appsink), stream_id);
 
-  *added_track = track_template;
+  return index_track (self, n_tracks (self) - 1);
+}
 
-  return ADDED;
+static void
+link_track (GstAppendPipeline * self, Track * track, GstPad * pad)
+{
+  GstPad *appsink_pad =
+      gst_element_get_static_pad (GST_ELEMENT (track->sink), "sink");
+  GstPadLinkReturn link_result = gst_pad_link (pad, appsink_pad);
+  gst_clear_object (&appsink_pad);
+  if (GST_PAD_LINK_FAILED (link_result)) {
+    g_error ("failed to link parser to appsink: %s",
+        gst_pad_link_get_name (link_result));
+  }
+  track->src_pad = gst_object_ref (pad);
+  track->stream = gst_pad_get_stream (pad);
+
+  GST_TRACE_OBJECT (self, "linked appsink %s to pad %s",
+      GST_OBJECT_NAME (track->sink), GST_OBJECT_NAME (pad));
+}
+
+static void
+unlink_track (GstAppendPipeline * self, Track * track)
+{
+  GstPad *appsink_pad =
+      gst_element_get_static_pad (GST_ELEMENT (track->sink), "sink");
+  gst_pad_unlink (track->src_pad, appsink_pad);
+  gst_clear_object (&appsink_pad);
+  gst_clear_object (&track->src_pad);
+  gst_clear_object (&track->stream);
+}
+
+static Track *
+find_track (GstAppendPipeline * self, const gchar * stream_id)
+{
+  guint track_count = n_tracks (self);
+  for (guint i = 0; i < track_count; i++) {
+    Track *track = index_track (self, i);
+    if (g_strcmp0 (track->stream_id, stream_id) == 0) {
+      return track;
+    }
+  }
+  return NULL;
 }
 
 static void
 clear_track (Track * track)
 {
+  g_clear_pointer (&track->stream_id, g_free);
   gst_clear_object (&track->sink);
   gst_clear_object (&track->src_pad);
   gst_clear_object (&track->mse_track);
@@ -576,19 +628,47 @@ init_segment_tracks_for (InitSegment * self, GstStreamType type)
   }
 }
 
+/* Lists the track in the initialization segment; the first track of each
+ * type is the active one. */
+static void
+add_init_segment_track (GstAppendPipeline * self, GstStreamType type,
+    GstMediaSourceTrack * mse_track)
+{
+  g_mutex_lock (&self->init_segment_lock);
+  GPtrArray *tracks = init_segment_tracks_for (&self->init_segment, type);
+  gboolean first = tracks->len < 1;
+  g_ptr_array_add (tracks, gst_object_ref (mse_track));
+  g_mutex_unlock (&self->init_segment_lock);
+  if (first) {
+    gst_media_source_track_set_active (mse_track, TRUE);
+  }
+}
+
 static void
 process_init_segment_track (GstPad * pad, GstAppendPipeline * self)
 {
   GST_OBJECT_LOCK (self);
-  InitSegment *init_segment = &self->init_segment;
   GstStream *stream = gst_pad_get_stream (pad);
   GstCaps *caps = gst_stream_get_caps (stream);
-  GST_DEBUG_OBJECT (self, "%" GST_PTR_FORMAT " got caps %" GST_PTR_FORMAT, pad,
-      caps);
+  gchar *stream_id = gst_pad_get_stream_id (pad);
+  GST_DEBUG_OBJECT (self, "%" GST_PTR_FORMAT " (stream %s) got caps %"
+      GST_PTR_FORMAT, pad, stream_id, caps);
 
   if (gst_pad_is_linked (pad)) {
     GST_TRACE_OBJECT (self, "%" GST_PTR_FORMAT " is already linked, skipping",
         pad);
+    goto done;
+  }
+
+  /* A track the demuxer already gave: its samples can flow now. A track
+   * whose stream-id changed in a later initialization segment may still be
+   * linked to parsebin's pad for its old stream. */
+  Track *track = find_track (self, stream_id);
+  if (track != NULL) {
+    if (track->src_pad != NULL) {
+      unlink_track (self, track);
+    }
+    link_track (self, track, pad);
     goto done;
   }
 
@@ -599,23 +679,16 @@ process_init_segment_track (GstPad * pad, GstAppendPipeline * self)
     goto done;
   }
 
-  Track track;
-  AddTrackResult result = add_track (self, pad, stream, caps, &track);
-  GstMediaSourceTrack *mse_track = track.mse_track;
-  switch (result) {
-    case ADDED:{
-      GstStreamType type = gst_stream_get_stream_type (stream);
-      g_mutex_lock (&self->init_segment_lock);
-      GPtrArray *tracks = init_segment_tracks_for (init_segment, type);
-      gboolean first = tracks->len < 1;
-      g_ptr_array_add (tracks, gst_object_ref (mse_track));
-      g_mutex_unlock (&self->init_segment_lock);
-      if (first) {
-        gst_media_source_track_set_active (mse_track, TRUE);
-      }
+  GstStreamType type = gst_stream_get_stream_type (stream);
+  switch (check_track (self, type, caps)) {
+    case ADDED:
+      track = append_track (self, type, stream_id, caps);
+      link_track (self, track, pad);
+      add_init_segment_track (self, type, track->mse_track);
       break;
-    }
     case IGNORED:
+      gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, black_hole_probe, self,
+          NULL);
       break;
     case PARSE_ERROR:
       call_parse_error (self);
@@ -623,6 +696,7 @@ process_init_segment_track (GstPad * pad, GstAppendPipeline * self)
   }
 
 done:
+  g_free (stream_id);
   gst_clear_object (&stream);
   gst_clear_caps (&caps);
   GST_OBJECT_UNLOCK (self);
@@ -672,27 +746,16 @@ has_all_tracks (GstAppendPipeline * self)
   return TRUE;
 }
 
+/* Called with the object lock held. The duration comes from the element that
+ * parsed the header: before parsebin exposes a pad, a query on parsebin
+ * reaches no demuxer. */
 static void
-process_init_segment (GstAppendPipeline * self)
+report_init_segment (GstAppendPipeline * self, GstElement * parser)
 {
   gint64 duration;
   InitSegment *init_segment = &self->init_segment;
 
-  GST_OBJECT_LOCK (self);
-
-  if (!has_all_tracks (self)) {
-    goto done;
-  }
-
-  if (self->streams == self->reported_streams) {
-    GST_DEBUG_OBJECT (self, "init segment already reported for %"
-        GST_PTR_FORMAT, self->streams);
-    goto done;
-  }
-  gst_clear_object (&self->reported_streams);
-  self->reported_streams = gst_object_ref (self->streams);
-
-  if (gst_element_query_duration (self->parsebin, GST_FORMAT_TIME, &duration)) {
+  if (gst_element_query_duration (parser, GST_FORMAT_TIME, &duration)) {
     init_segment->duration = MAX (0, duration);
   } else {
     init_segment->duration = GST_CLOCK_TIME_NONE;
@@ -706,9 +769,281 @@ process_init_segment (GstAppendPipeline * self)
   g_mutex_unlock (&self->init_segment_lock);
 
   call_received_init_segment (self);
+}
+
+/* Reports the initialization segment once parsebin's stream collection has
+ * a track for each of its streams. That is the whole report for bytes with
+ * no demuxer, such as ADTS AAC; with a demuxer it is only the fallback for
+ * one that never says no-more-pads. */
+static void
+process_init_segment (GstAppendPipeline * self)
+{
+  GST_OBJECT_LOCK (self);
+
+  if (self->have_demuxer && self->received_init_segment) {
+    goto done;
+  }
+
+  if (!has_all_tracks (self)) {
+    goto done;
+  }
+
+  if (self->streams == self->reported_streams) {
+    GST_DEBUG_OBJECT (self, "init segment already reported for %"
+        GST_PTR_FORMAT, self->streams);
+    goto done;
+  }
+  gst_clear_object (&self->reported_streams);
+  self->reported_streams = gst_object_ref (self->streams);
+
+  report_init_segment (self, self->parsebin);
 
 done:
   GST_OBJECT_UNLOCK (self);
+}
+
+/* The stream type parsebin would give a stream with these caps: a copy of
+ * guess_stream_type_from_caps() in gstparsebin.c, which is not public.
+ * Tracks from the demuxer and tracks from parsebin's pads must agree. */
+GstStreamType
+gst_append_pipeline_stream_type_from_caps (GstCaps * caps)
+{
+  GstStructure *structure = gst_caps_get_structure (caps, 0);
+  const gchar *name = gst_structure_get_name (structure);
+  /* The caps of an encrypted stream name the encryption; the field names
+   * what it carries, and is only of use as a string. */
+  if (gst_structure_has_field_typed (structure, "original-media-type",
+          G_TYPE_STRING)) {
+    name = gst_structure_get_string (structure, "original-media-type");
+  }
+  if (g_str_has_prefix (name, "video/") || g_str_has_prefix (name, "image/")) {
+    return GST_STREAM_TYPE_VIDEO;
+  }
+  if (g_str_has_prefix (name, "audio/")) {
+    return GST_STREAM_TYPE_AUDIO;
+  }
+  if (g_str_has_prefix (name, "text/") || g_str_has_prefix (name, "subtitle/")
+      || g_str_has_prefix (name, "subpicture/")
+      || g_str_has_prefix (name, "closedcaption/")) {
+    return GST_STREAM_TYPE_TEXT;
+  }
+  if (g_str_has_prefix (name, "meta/")) {
+    return GST_STREAM_TYPE_METADATA;
+  }
+  /* Subtitle formats such as application/x-subtitle-vtt and
+   * application/x-ssa say what they are only in pbutils' table. Only an
+   * elementary stream counts, hence the equality. */
+  switch (gst_pb_utils_get_caps_description_flags (caps)) {
+    case GST_PBUTILS_CAPS_DESCRIPTION_FLAG_AUDIO:
+      return GST_STREAM_TYPE_AUDIO;
+    case GST_PBUTILS_CAPS_DESCRIPTION_FLAG_VIDEO:
+      return GST_STREAM_TYPE_VIDEO;
+    case GST_PBUTILS_CAPS_DESCRIPTION_FLAG_SUBTITLE:
+      return GST_STREAM_TYPE_TEXT;
+    case GST_PBUTILS_CAPS_DESCRIPTION_FLAG_METADATA:
+      return GST_STREAM_TYPE_METADATA;
+    default:
+      return GST_STREAM_TYPE_UNKNOWN;
+  }
+}
+
+typedef struct
+{
+  gchar *stream_id;
+  GstCaps *caps;
+  GstStreamType type;
+} DemuxerStream;
+
+static void
+demuxer_stream_clear (DemuxerStream * stream)
+{
+  g_clear_pointer (&stream->stream_id, g_free);
+  gst_clear_caps (&stream->caps);
+}
+
+static guint
+type_rank (GstStreamType type)
+{
+  switch (type) {
+    case GST_STREAM_TYPE_VIDEO:
+      return 0;
+    case GST_STREAM_TYPE_AUDIO:
+      return 1;
+    case GST_STREAM_TYPE_TEXT:
+      return 2;
+    default:
+      return 3;
+  }
+}
+
+/* parsebin's order: video, then audio, then text, then by stream-id. Tracks
+ * are named by their position, and a reset keeps a track only for the same
+ * type and name, so the order must not depend on the order of the
+ * container's tracks. */
+static gint
+compare_demuxer_streams (gconstpointer a, gconstpointer b)
+{
+  const DemuxerStream *stream_a = a;
+  const DemuxerStream *stream_b = b;
+  guint rank_a = type_rank (stream_a->type);
+  guint rank_b = type_rank (stream_b->type);
+  if (rank_a != rank_b) {
+    return rank_a < rank_b ? -1 : 1;
+  }
+  return g_strcmp0 (stream_a->stream_id, stream_b->stream_id);
+}
+
+static gboolean
+add_demuxer_stream (GstElement * demuxer, GstPad * pad, gpointer user_data)
+{
+  GArray *streams = user_data;
+  DemuxerStream stream = {
+    .stream_id = gst_pad_get_stream_id (pad),
+    .caps = gst_pad_get_current_caps (pad),
+  };
+  if (stream.stream_id == NULL || stream.caps == NULL
+      || gst_caps_is_empty (stream.caps)) {
+    GST_DEBUG_OBJECT (pad, "no stream yet");
+    demuxer_stream_clear (&stream);
+    return TRUE;
+  }
+  stream.type = gst_append_pipeline_stream_type_from_caps (stream.caps);
+  g_array_append_val (streams, stream);
+  return TRUE;
+}
+
+/* The track a demuxer stream with a new stream-id takes over, or NULL.
+ * MSE, Initialization Segment Received, step 3, asks a later
+ * initialization segment for the track IDs of the first only when a type
+ * has more than one track: a lone track of a type may change its ID, for
+ * example in media from another packager, and is still the track of that
+ * type. */
+static Track *
+find_track_with_new_id (GstAppendPipeline * self, GArray * streams,
+    GstStreamType type)
+{
+  guint streams_of_type = 0;
+  for (guint i = 0; i < streams->len; i++) {
+    if (g_array_index (streams, DemuxerStream, i).type == type) {
+      streams_of_type++;
+    }
+  }
+  if (streams_of_type != 1) {
+    return NULL;
+  }
+
+  Track *found = NULL;
+  guint track_count = n_tracks (self);
+  for (guint i = 0; i < track_count; i++) {
+    Track *track = index_track (self, i);
+    if (gst_media_source_track_get_stream_type (track->mse_track) != type) {
+      continue;
+    }
+    if (found != NULL) {
+      return NULL;
+    }
+    found = track;
+  }
+  return found;
+}
+
+/* The demuxer has added a pad for every track of the initialization
+ * segment, each with its stream-start and caps: they are the tracks. */
+static void
+on_demuxer_no_more_pads (GstElement * demuxer, gpointer user_data)
+{
+  GstAppendPipeline *self = GST_APPEND_PIPELINE (user_data);
+  GArray *streams = g_array_new (FALSE, TRUE, sizeof (DemuxerStream));
+  g_array_set_clear_func (streams, (GDestroyNotify) demuxer_stream_clear);
+  gst_element_foreach_src_pad (demuxer, add_demuxer_stream, streams);
+  g_array_sort (streams, compare_demuxer_streams);
+
+  GST_OBJECT_LOCK (self);
+  gboolean added = FALSE;
+  gboolean failed = FALSE;
+  for (guint i = 0; i < streams->len; i++) {
+    DemuxerStream *stream = &g_array_index (streams, DemuxerStream, i);
+    if (find_track (self, stream->stream_id) != NULL) {
+      continue;
+    }
+    Track *renamed = find_track_with_new_id (self, streams, stream->type);
+    if (renamed != NULL) {
+      /* parsebin's pad for the new stream-id is linked to this track when
+       * it comes, as for any track known from the demuxer. */
+      GST_DEBUG_OBJECT (self, "stream %s continues track %s",
+          stream->stream_id, gst_media_source_track_get_id
+          (renamed->mse_track));
+      g_free (renamed->stream_id);
+      renamed->stream_id = g_strdup (stream->stream_id);
+      continue;
+    }
+    switch (check_track (self, stream->type, stream->caps)) {
+      case ADDED:{
+        Track *track = append_track (self, stream->type, stream->stream_id,
+            stream->caps);
+        add_init_segment_track (self, stream->type, track->mse_track);
+        added = TRUE;
+        break;
+      }
+      case IGNORED:
+        break;
+      case PARSE_ERROR:
+        failed = TRUE;
+        break;
+    }
+  }
+  g_array_unref (streams);
+
+  if (failed) {
+    call_parse_error (self);
+  } else if (added || !self->received_init_segment) {
+    /* With the same tracks, a later initialization segment makes qtdemux
+     * reuse its pads, and it says no-more-pads only when the tracks
+     * change. One that only drops a track adds none here and is not
+     * reported again. */
+    report_init_segment (self, demuxer);
+  }
+  GST_OBJECT_UNLOCK (self);
+}
+
+static gboolean
+is_container_demuxer (GstElement * element)
+{
+  GstElementFactory *factory = gst_element_get_factory (element);
+  if (factory == NULL || !gst_element_factory_list_is_type (factory,
+          GST_ELEMENT_FACTORY_TYPE_DEMUXER)) {
+    return FALSE;
+  }
+  /* A tag demuxer such as id3demux, "Codec/Demuxer/Metadata", strips a tag
+   * and passes the rest on whole: its pad is not a track. */
+  const gchar *klass = gst_element_factory_get_metadata (factory,
+      GST_ELEMENT_METADATA_KLASS);
+  return klass != NULL && strstr (klass, "Metadata") == NULL;
+}
+
+static void
+on_deep_element_added (GstBin * parsebin, GstBin * sub_bin,
+    GstElement * element, gpointer user_data)
+{
+  GstAppendPipeline *self = GST_APPEND_PIPELINE (user_data);
+  if (!is_container_demuxer (element)) {
+    return;
+  }
+
+  GST_OBJECT_LOCK (self);
+  gboolean first = !self->have_demuxer;
+  self->have_demuxer = TRUE;
+  GST_OBJECT_UNLOCK (self);
+
+  /* Only the container's demuxer, the first one parsebin plugs, gives the
+   * tracks. */
+  if (!first) {
+    GST_DEBUG_OBJECT (self, "not watching %" GST_PTR_FORMAT, element);
+    return;
+  }
+  GST_DEBUG_OBJECT (self, "tracks come from %" GST_PTR_FORMAT, element);
+  g_signal_connect_object (element, "no-more-pads",
+      G_CALLBACK (on_demuxer_no_more_pads), self, 0);
 }
 
 static inline void
@@ -806,7 +1141,12 @@ gst_append_pipeline_init (GstAppendPipeline * self)
 
   g_signal_connect_object (parsebin, "pad-added", G_CALLBACK (on_pad_added),
       self, 0);
+  /* Connected before parsebin connects its own handlers to the demuxer, so
+   * the tracks exist by the time parsebin exposes pads for them. */
+  g_signal_connect_object (parsebin, "deep-element-added",
+      G_CALLBACK (on_deep_element_added), self, 0);
 
+  self->have_demuxer = FALSE;
   self->received_init_segment = FALSE;
   self->encountered_error = FALSE;
   self->tracks = new_tracks_array ();
@@ -897,6 +1237,15 @@ error:
   return NULL;
 }
 
+/* Tells the parser what the appended bytes are, so it does not have to
+ * typefind them first. */
+void
+gst_append_pipeline_set_caps (GstAppendPipeline * self, GstCaps * caps)
+{
+  g_return_if_fail (GST_IS_APPEND_PIPELINE (self));
+  gst_app_src_set_caps (self->src, caps);
+}
+
 GstFlowReturn
 gst_append_pipeline_append (GstAppendPipeline * self, GstBuffer * buffer)
 {
@@ -954,6 +1303,7 @@ gst_append_pipeline_stop (GstAppendPipeline * self)
         gst_state_change_return_get_name (stopped));
     return FALSE;
   }
+  self->have_demuxer = FALSE;
   self->received_init_segment = FALSE;
   self->encountered_error = FALSE;
   appends_done (self, TRUE);
@@ -1022,6 +1372,9 @@ gst_append_pipeline_reset (GstAppendPipeline * self)
   gst_clear_object (&self->reported_streams);
   g_array_free (self->tracks, TRUE);
 
+  /* parsebin removed its elements on the way to READY and plugs a new
+   * demuxer for the next initialization segment. */
+  self->have_demuxer = FALSE;
   self->have_outstanding_samples = FALSE;
   self->encountered_error = FALSE;
   self->tracks = new_tracks_array ();

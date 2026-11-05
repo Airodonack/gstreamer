@@ -165,6 +165,113 @@ test_mp4_before_box (const gchar * type)
   return prefix;
 }
 
+/* The bytes of mse.mp4 from its first box of the given type on. */
+static GstBuffer *
+test_mp4_from_box (const gchar * type)
+{
+  GstBuffer *whole = test_mp4_buffer ();
+  gsize offset = mp4_box_offset (whole, type);
+  GstBuffer *suffix = gst_buffer_copy_region (whole, GST_BUFFER_COPY_MEMORY,
+      offset, gst_buffer_get_size (whole) - offset);
+  gst_buffer_unref (whole);
+  return suffix;
+}
+
+typedef void (*Mp4BoxFunc) (guint8 * box, gpointer user_data);
+
+/* Calls func on every box between start and end, and on the boxes inside
+ * the containers on the way to the track IDs and the sample descriptions.
+ * mse.mp4 has no 64-bit box sizes. */
+static void
+mp4_foreach_box (guint8 * data, gsize start, gsize end, Mp4BoxFunc func,
+    gpointer user_data)
+{
+  static const gchar *containers[] = { "moov", "trak", "mdia", "minf",
+    "stbl", "mvex", "moof", "traf"
+  };
+  gsize offset = start;
+  while (offset + 8 <= end) {
+    guint32 size = GST_READ_UINT32_BE (data + offset);
+    fail_unless (size >= 8 && offset + size <= end);
+    func (data + offset, user_data);
+    for (guint i = 0; i < G_N_ELEMENTS (containers); i++) {
+      if (memcmp (data + offset + 4, containers[i], 4) == 0) {
+        mp4_foreach_box (data, offset + 8, offset + size, func, user_data);
+      }
+    }
+    /* A sample description box is a full box with an entry count, then
+     * one box per sample entry. */
+    if (memcmp (data + offset + 4, "stsd", 4) == 0) {
+      mp4_foreach_box (data, offset + 16, offset + size, func, user_data);
+    }
+    offset += size;
+  }
+}
+
+static void
+mp4_edit_boxes (GstBuffer * buffer, Mp4BoxFunc func, gpointer user_data)
+{
+  GstMapInfo map;
+  fail_unless (gst_buffer_map (buffer, &map, GST_MAP_READWRITE));
+  mp4_foreach_box (map.data, 0, map.size, func, user_data);
+  gst_buffer_unmap (buffer, &map);
+}
+
+/* Moves the track with ID 1 to ID 5 where a box names it: the track
+ * header, the track extends box and every track fragment header. */
+static void
+renumber_track_1_to_5 (guint8 * box, gpointer user_data)
+{
+  guint8 *track_id = NULL;
+  if (memcmp (box + 4, "tkhd", 4) == 0) {
+    /* After the version and flags, a creation and a modification time of
+     * 32 bits each in version 0, 64 bits each in version 1. */
+    track_id = box + 12 + (box[8] == 1 ? 16 : 8);
+  } else if (memcmp (box + 4, "trex", 4) == 0
+      || memcmp (box + 4, "tfhd", 4) == 0) {
+    track_id = box + 12;
+  }
+  if (track_id != NULL && GST_READ_UINT32_BE (track_id) == 1) {
+    GST_WRITE_UINT32_BE (track_id, 5);
+    (*(guint *) user_data)++;
+  }
+}
+
+/* The bytes of mse.mp4, or the part of them given, with its video track,
+ * track 1, renumbered to track 5. */
+static GstBuffer *
+with_video_track_5 (GstBuffer * buffer)
+{
+  guint renumbered = 0;
+  mp4_edit_boxes (buffer, renumber_track_1_to_5, &renumbered);
+  /* The track header and the track extends box, and a track fragment
+   * header when there is media. */
+  fail_unless (renumbered >= 2);
+  return buffer;
+}
+
+/* Turns the 3GPP timed text sample entry into a WebVTT one, which qtdemux
+ * describes with application/x-subtitle-vtt. */
+static void
+make_text_webvtt (guint8 * box, gpointer user_data)
+{
+  if (memcmp (box + 4, "tx3g", 4) == 0) {
+    memcpy (box + 4, "wvtt", 4);
+    (*(guint *) user_data)++;
+  }
+}
+
+/* The initialization segment of mse.mp4 with a WebVTT text track. */
+static GstBuffer *
+test_mp4_init_segment_with_webvtt (void)
+{
+  GstBuffer *buffer = test_mp4_before_box ("moof");
+  guint changed = 0;
+  mp4_edit_boxes (buffer, make_text_webvtt, &changed);
+  fail_unless_equals_int (changed, 1);
+  return buffer;
+}
+
 /* The file type box of mse.mp4 followed by a box whose size field is
  * smaller than a box header, which the demuxer rejects. The padding gives
  * typefinding the 2 KiB it wants before it looks at the bytes. */
@@ -256,6 +363,16 @@ await_update_end (SourceBufferEvents * events, guint count)
     }
   }
   g_mutex_unlock (&events->mutex);
+}
+
+static guint
+n_active_source_buffers (GstMediaSource * media_source)
+{
+  GstSourceBufferList *active_buffers =
+      gst_media_source_get_active_source_buffers (media_source);
+  guint n = gst_source_buffer_list_get_length (active_buffers);
+  gst_object_unref (active_buffers);
+  return n;
 }
 
 /* Waits until the source buffer has emitted error count times. */
@@ -874,6 +991,9 @@ typedef struct
 {
   AppendPipelineTestContext base;
   gint init_segments;
+  GMutex samples_mutex;
+  /* Samples received, by track. */
+  GHashTable *samples;
 } TracksTestContext;
 
 static void
@@ -882,6 +1002,272 @@ count_init_segment (GstAppendPipeline * pipeline, gpointer user_data)
   TracksTestContext *context = user_data;
   g_atomic_int_inc (&context->init_segments);
 }
+
+static void
+count_sample (GstAppendPipeline * pipeline, GstMediaSourceTrack * track,
+    GstSample * sample, gpointer user_data)
+{
+  TracksTestContext *context = user_data;
+  g_mutex_lock (&context->samples_mutex);
+  guint count = GPOINTER_TO_UINT (g_hash_table_lookup (context->samples,
+          track));
+  g_hash_table_insert (context->samples, track, GUINT_TO_POINTER (count + 1));
+  g_mutex_unlock (&context->samples_mutex);
+}
+
+static guint
+samples_for (TracksTestContext * context, GstMediaSourceTrack * track)
+{
+  g_mutex_lock (&context->samples_mutex);
+  guint count = GPOINTER_TO_UINT (g_hash_table_lookup (context->samples,
+          track));
+  g_mutex_unlock (&context->samples_mutex);
+  return count;
+}
+
+static GstAppendPipeline *
+tracks_test_pipeline (TracksTestContext * context)
+{
+  GstAppendPipelineCallbacks callbacks = {
+    .received_init_segment = count_init_segment,
+    .new_sample = count_sample,
+    .eos = test_append_pipeline_eos,
+    .error = test_append_pipeline_error,
+  };
+  context->samples = g_hash_table_new (NULL, NULL);
+  GstAppendPipeline *pipeline =
+      gst_append_pipeline_new (&callbacks, context, NULL);
+  GstCaps *caps = gst_caps_new_simple ("video/quicktime", "variant",
+      G_TYPE_STRING, "iso", NULL);
+  gst_append_pipeline_set_caps (pipeline, caps);
+  gst_caps_unref (caps);
+  return pipeline;
+}
+
+static void
+tracks_test_pipeline_free (GstAppendPipeline * pipeline,
+    TracksTestContext * context)
+{
+  gst_object_unref (pipeline);
+  g_hash_table_unref (context->samples);
+}
+
+static void
+assert_track (GstMediaSourceTrack * track, const gchar * media_type)
+{
+  GstCaps *caps = gst_media_source_track_get_initial_caps (track);
+  fail_unless (GST_IS_CAPS (caps));
+  GstStructure *structure = gst_caps_get_structure (caps, 0);
+  fail_unless_equals_string (gst_structure_get_name (structure), media_type);
+  fail_unless (gst_structure_has_field (structure, "codec_data"),
+      "%" GST_PTR_FORMAT " has no codec data", caps);
+  fail_unless (gst_media_source_track_get_active (track));
+}
+
+/* mse-h264-aac-init.mp4 with the duration of its movie header, the first
+ * box in its moov, set to the given milliseconds (its timescale). */
+static GstBuffer *
+init_segment_with_duration (guint32 milliseconds)
+{
+  GstBuffer *buffer = test_file_buffer ("mse-h264-aac-init.mp4");
+  gsize mvhd = mp4_box_offset (buffer, "moov") + 8;
+  GstMapInfo map;
+  fail_unless (gst_buffer_map (buffer, &map, GST_MAP_READWRITE));
+  fail_unless (memcmp (map.data + mvhd + 4, "mvhd", 4) == 0);
+  fail_unless_equals_int (map.data[mvhd + 8], 0);
+  fail_unless_equals_int (GST_READ_UINT32_BE (map.data + mvhd + 20), 1000);
+  GST_WRITE_UINT32_BE (map.data + mvhd + 24, milliseconds);
+  gst_buffer_unmap (buffer, &map);
+  return buffer;
+}
+
+GST_START_TEST (test_append_pipeline_init_segment_alone_has_tracks)
+{
+  /* Proves an MP4 initialization segment on its own reports its tracks
+   * once, each with the codec and codec data of its sample description,
+   * and its duration, though no parser has seen a frame: the tracks and
+   * the duration come from the demuxer. */
+  TracksTestContext context = { 0 };
+  GstAppendPipeline *pipeline = tracks_test_pipeline (&context);
+
+  fail_unless (gst_append_pipeline_append (pipeline,
+          init_segment_with_duration (4000)) == GST_FLOW_OK);
+  gst_append_pipeline_wait_for_appends (pipeline);
+  fail_if (gst_append_pipeline_get_failed (pipeline));
+  fail_unless_equals_int (g_atomic_int_get (&context.init_segments), 1);
+  fail_unless_equals_int (gst_append_pipeline_n_tracks (pipeline), 2);
+  fail_unless_equals_uint64 (gst_append_pipeline_get_duration (pipeline),
+      4 * GST_SECOND);
+
+  GPtrArray *video_tracks = gst_append_pipeline_get_video_tracks (pipeline);
+  GPtrArray *audio_tracks = gst_append_pipeline_get_audio_tracks (pipeline);
+  fail_unless (video_tracks != NULL && audio_tracks != NULL,
+      "no initialization segment");
+  fail_unless_equals_int (video_tracks->len, 1);
+  fail_unless_equals_int (audio_tracks->len, 1);
+  assert_track (g_ptr_array_index (video_tracks, 0), "video/x-h264");
+  assert_track (g_ptr_array_index (audio_tracks, 0), "audio/mpeg");
+  GstCaps *audio_caps =
+      gst_media_source_track_get_initial_caps (g_ptr_array_index
+      (audio_tracks, 0));
+  gint mpeg_version = 0;
+  gst_structure_get_int (gst_caps_get_structure (audio_caps, 0),
+      "mpegversion", &mpeg_version);
+  fail_unless_equals_int (mpeg_version, 4);
+  g_ptr_array_unref (video_tracks);
+  g_ptr_array_unref (audio_tracks);
+
+  tracks_test_pipeline_free (pipeline, &context);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_append_pipeline_init_segment_new_track_id)
+{
+  /* Proves a later initialization segment whose only video track has
+   * another track ID keeps the video track: the demuxer gives a new pad
+   * for the new ID, and the track count stays that of the first
+   * initialization segment, so it is not reported as a new track. */
+  TracksTestContext context = { 0 };
+  GstAppendPipeline *pipeline = tracks_test_pipeline (&context);
+
+  fail_unless (gst_append_pipeline_append (pipeline,
+          test_mp4_before_box ("moof")) == GST_FLOW_OK);
+  gst_append_pipeline_wait_for_appends (pipeline);
+  GPtrArray *first_video = gst_append_pipeline_get_video_tracks (pipeline);
+  fail_unless (first_video != NULL, "no initialization segment");
+  fail_unless_equals_int (first_video->len, 1);
+
+  fail_unless (gst_append_pipeline_append (pipeline,
+          with_video_track_5 (test_mp4_before_box ("moof"))) == GST_FLOW_OK);
+  gst_append_pipeline_wait_for_appends (pipeline);
+  fail_if (gst_append_pipeline_get_failed (pipeline));
+  fail_unless_equals_int (gst_append_pipeline_n_tracks (pipeline), 3);
+  fail_unless_equals_int (g_atomic_int_get (&context.init_segments), 1);
+  GPtrArray *second_video = gst_append_pipeline_get_video_tracks (pipeline);
+  fail_unless_equals_int (second_video->len, 1);
+  fail_unless (g_ptr_array_index (second_video, 0) ==
+      g_ptr_array_index (first_video, 0));
+  g_ptr_array_unref (first_video);
+  g_ptr_array_unref (second_video);
+
+  tracks_test_pipeline_free (pipeline, &context);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_append_pipeline_init_segment_webvtt_track)
+{
+  /* Proves a WebVTT track of an MP4 initialization segment is a text
+   * track: its caps, application/x-subtitle-vtt, name no media type that
+   * says so. */
+  TracksTestContext context = { 0 };
+  GstAppendPipeline *pipeline = tracks_test_pipeline (&context);
+
+  fail_unless (gst_append_pipeline_append (pipeline,
+          test_mp4_init_segment_with_webvtt ()) == GST_FLOW_OK);
+  gst_append_pipeline_wait_for_appends (pipeline);
+  fail_if (gst_append_pipeline_get_failed (pipeline));
+  fail_unless_equals_int (g_atomic_int_get (&context.init_segments), 1);
+  fail_unless_equals_int (gst_append_pipeline_n_tracks (pipeline), 3);
+  GPtrArray *text_tracks = gst_append_pipeline_get_text_tracks (pipeline);
+  fail_unless (text_tracks != NULL, "no initialization segment");
+  fail_unless_equals_int (text_tracks->len, 1);
+  g_ptr_array_unref (text_tracks);
+
+  tracks_test_pipeline_free (pipeline, &context);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_append_pipeline_stream_type_from_caps)
+{
+  /* Proves the demuxer's caps give the stream types parsebin gives: the
+   * subtitle formats whose media type does not say so are text, and the
+   * original media type of an encrypted stream counts only when it is a
+   * string. */
+  static const struct
+  {
+    const gchar *caps;
+    GstStreamType type;
+  } cases[] = {
+    {"video/x-h264", GST_STREAM_TYPE_VIDEO},
+    {"audio/mpeg", GST_STREAM_TYPE_AUDIO},
+    {"text/x-raw", GST_STREAM_TYPE_TEXT},
+    {"application/x-subtitle-vtt", GST_STREAM_TYPE_TEXT},
+    {"application/x-ssa", GST_STREAM_TYPE_TEXT},
+    {"application/x-ass", GST_STREAM_TYPE_TEXT},
+    {"application/x-cenc, original-media-type=(string)video/x-h264",
+        GST_STREAM_TYPE_VIDEO},
+    {"application/x-cenc, original-media-type=(int)1",
+        GST_STREAM_TYPE_UNKNOWN},
+  };
+  for (guint i = 0; i < G_N_ELEMENTS (cases); i++) {
+    GstCaps *caps = gst_caps_from_string (cases[i].caps);
+    fail_unless (GST_IS_CAPS (caps));
+    fail_unless_equals_int (gst_append_pipeline_stream_type_from_caps (caps),
+        cases[i].type);
+    gst_caps_unref (caps);
+  }
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_append_pipeline_media_segment_feeds_init_segment_tracks)
+{
+  /* Proves the media segment after an initialization segment feeds the
+   * tracks that segment reported. parsebin exposes the parsers' pads only
+   * once they have seen frames; each pad is matched to the track the
+   * demuxer gave for it, so no track is added and the segment is not
+   * reported again. */
+  TracksTestContext context = { 0 };
+  GstAppendPipeline *pipeline = tracks_test_pipeline (&context);
+
+  fail_unless (gst_append_pipeline_append (pipeline,
+          test_mp4_before_box ("moof")) == GST_FLOW_OK);
+  gst_append_pipeline_wait_for_appends (pipeline);
+  fail_unless_equals_int (g_atomic_int_get (&context.init_segments), 1);
+  fail_unless_equals_int (gst_append_pipeline_n_tracks (pipeline), 3);
+  GPtrArray *video_tracks = gst_append_pipeline_get_video_tracks (pipeline);
+  GPtrArray *audio_tracks = gst_append_pipeline_get_audio_tracks (pipeline);
+  fail_unless (video_tracks != NULL && audio_tracks != NULL,
+      "no initialization segment");
+  fail_unless_equals_int (video_tracks->len, 1);
+  fail_unless_equals_int (audio_tracks->len, 1);
+
+  fail_unless (gst_append_pipeline_append (pipeline,
+          test_mp4_from_box ("moof")) == GST_FLOW_OK);
+  gst_append_pipeline_wait_for_appends (pipeline);
+  fail_if (gst_append_pipeline_get_failed (pipeline));
+  fail_unless_equals_int (g_atomic_int_get (&context.init_segments), 1);
+  fail_unless_equals_int (gst_append_pipeline_n_tracks (pipeline), 3);
+
+  GstMediaSourceTrack *video = g_ptr_array_index (video_tracks, 0);
+  GstMediaSourceTrack *audio = g_ptr_array_index (audio_tracks, 0);
+  fail_unless (samples_for (&context, video) > 0, "no video samples");
+  fail_unless (samples_for (&context, audio) > 0, "no audio samples");
+  GPtrArray *text_tracks = gst_append_pipeline_get_text_tracks (pipeline);
+  guint known_samples = samples_for (&context, video) +
+      samples_for (&context, audio);
+  for (guint i = 0; i < text_tracks->len; i++) {
+    known_samples += samples_for (&context, g_ptr_array_index (text_tracks, i));
+  }
+  guint all_samples = 0;
+  GHashTableIter iter;
+  gpointer count;
+  g_hash_table_iter_init (&iter, context.samples);
+  while (g_hash_table_iter_next (&iter, NULL, &count)) {
+    all_samples += GPOINTER_TO_UINT (count);
+  }
+  fail_unless_equals_int (all_samples, known_samples);
+
+  g_ptr_array_unref (video_tracks);
+  g_ptr_array_unref (audio_tracks);
+  g_ptr_array_unref (text_tracks);
+  tracks_test_pipeline_free (pipeline, &context);
+}
+
+GST_END_TEST;
 
 GST_START_TEST (test_append_pipeline_init_segment_reported_once)
 {
@@ -1529,6 +1915,55 @@ GST_START_TEST (test_source_buffer_remove_reopens_ended_source)
 
 GST_END_TEST;
 
+GST_START_TEST (test_source_buffer_init_segment_alone_activates)
+{
+  /* Proves an MP4 initialization segment on its own gives the source
+   * buffer its tracks, so that it joins the active source buffers by the
+   * time its append ends: H.264 and AAC here, then the H.264, MPEG audio
+   * and text of mse.mp4, whose MPEG audio parser has no caps before a
+   * frame. The tracks come from the demuxer's pads, not from the parsers
+   * behind them. */
+  GstMediaSource *media_source;
+  GstSourceBuffer *source_buffer = mp4_source_buffer (&media_source);
+  SourceBufferEvents events;
+  source_buffer_events_init (&events, source_buffer);
+  GError *error = NULL;
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_file_buffer ("mse-h264-aac-init.mp4"), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+  fail_unless_equals_int (events.error, 0);
+  fail_unless_equals_int (n_active_source_buffers (media_source), 1);
+
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+
+  source_buffer = mp4_source_buffer (&media_source);
+  source_buffer_events_init (&events, source_buffer);
+
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_before_box ("moof"), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 1);
+  fail_unless_equals_int (events.error, 0);
+  fail_unless_equals_int (n_active_source_buffers (media_source), 1);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          test_mp4_from_box ("moof"), &error));
+  g_assert_no_error (error);
+  await_update_end (&events, 2);
+  fail_unless_equals_int (events.error, 0);
+  fail_unless_equals_int (n_active_source_buffers (media_source), 1);
+
+  source_buffer_events_clear (&events, source_buffer);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+}
+
+GST_END_TEST;
+
+
 GST_START_TEST (test_source_buffer_removed_in_event_handler)
 {
   /* Proves a source buffer can be removed, and lose its last reference,
@@ -2121,11 +2556,23 @@ mse_suite (void)
     tcase_add_test (tc_source_buffer,
         test_source_buffer_parse_error_reported_once);
     tcase_add_test (tc_source_buffer, test_source_buffer_remove_range);
+    tcase_add_test (tc_source_buffer,
+        test_source_buffer_init_segment_alone_activates);
   }
 
   tcase_add_test (tc_append_pipeline, test_append_pipeline_create_and_free);
   tcase_add_test (tc_append_pipeline, test_append_pipeline_mp4);
   tcase_add_test (tc_append_pipeline, test_append_pipeline_webm);
+  tcase_add_test (tc_append_pipeline,
+      test_append_pipeline_init_segment_alone_has_tracks);
+  tcase_add_test (tc_append_pipeline,
+      test_append_pipeline_init_segment_new_track_id);
+  tcase_add_test (tc_append_pipeline,
+      test_append_pipeline_init_segment_webvtt_track);
+  tcase_add_test (tc_append_pipeline,
+      test_append_pipeline_stream_type_from_caps);
+  tcase_add_test (tc_append_pipeline,
+      test_append_pipeline_media_segment_feeds_init_segment_tracks);
   tcase_add_test (tc_append_pipeline,
       test_append_pipeline_init_segment_reported_once);
   tcase_add_test (tc_append_pipeline,

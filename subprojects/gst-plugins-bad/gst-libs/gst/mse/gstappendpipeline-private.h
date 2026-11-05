@@ -64,6 +64,9 @@ GstFlowReturn gst_append_pipeline_append (GstAppendPipeline * self,
     GstBuffer * buffer);
 
 GST_MSE_PRIVATE
+void gst_append_pipeline_set_caps (GstAppendPipeline * self, GstCaps * caps);
+
+GST_MSE_PRIVATE
 void gst_append_pipeline_wait_for_appends (GstAppendPipeline * self);
 
 GST_MSE_PRIVATE
@@ -95,6 +98,9 @@ GPtrArray *gst_append_pipeline_get_video_tracks (GstAppendPipeline * self);
 
 GST_MSE_PRIVATE
 gboolean gst_append_pipeline_get_eos (GstAppendPipeline * self);
+
+GST_MSE_PRIVATE
+GstStreamType gst_append_pipeline_stream_type_from_caps (GstCaps * caps);
 
 GST_MSE_PRIVATE
 void gst_append_pipeline_fail (GstAppendPipeline * self);
