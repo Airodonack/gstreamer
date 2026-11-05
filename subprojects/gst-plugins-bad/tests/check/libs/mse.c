@@ -382,6 +382,166 @@ GST_START_TEST (test_clear_live_seekable_range_on_opened_media_source)
 
 GST_END_TEST;
 
+/* What msesrc pushed in test_media_source_element_frees_played_media: the
+ * memory of its buffers and how much of it is freed, its pads and their EOS
+ * events, and the source buffer's update-end events. */
+typedef struct
+{
+  GMutex mutex;
+  GCond cond;
+  GstElement *pipeline;
+  GHashTable *live;
+  guint pushed;
+  guint freed;
+  guint pads;
+  guint eos;
+  guint update_end;
+} PlayedMedia;
+
+static void
+played_memory_freed (PlayedMedia * played, GstMiniObject * where)
+{
+  g_mutex_lock (&played->mutex);
+  g_hash_table_remove (played->live, where);
+  played->freed++;
+  g_cond_broadcast (&played->cond);
+  g_mutex_unlock (&played->mutex);
+}
+
+static GstPadProbeReturn
+watch_played_media (GstPad * pad, GstPadProbeInfo * info, PlayedMedia * played)
+{
+  g_mutex_lock (&played->mutex);
+  if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER) {
+    GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER (info);
+    for (guint i = 0; i < gst_buffer_n_memory (buffer); i++) {
+      GstMemory *memory = gst_buffer_peek_memory (buffer, i);
+      if (g_hash_table_add (played->live, memory)) {
+        gst_mini_object_weak_ref (GST_MINI_OBJECT (memory),
+            (GstMiniObjectNotify) played_memory_freed, played);
+        played->pushed++;
+      }
+    }
+  } else if (GST_EVENT_TYPE (GST_PAD_PROBE_INFO_EVENT (info)) == GST_EVENT_EOS) {
+    played->eos++;
+  }
+  g_cond_broadcast (&played->cond);
+  g_mutex_unlock (&played->mutex);
+  return GST_PAD_PROBE_OK;
+}
+
+static void
+play_into_fakesink (GstElement * src, GstPad * pad, PlayedMedia * played)
+{
+  /* The probe goes on before the pad is linked, so it sees every buffer. */
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER |
+      GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+      (GstPadProbeCallback) watch_played_media, played, NULL);
+  GstElement *sink = gst_element_factory_make ("fakesink", NULL);
+  g_object_set (sink, "sync", FALSE, NULL);
+  gst_bin_add (GST_BIN (played->pipeline), sink);
+  GstPad *sink_pad = gst_element_get_static_pad (sink, "sink");
+  fail_unless (gst_element_sync_state_with_parent (sink));
+  fail_unless_equals_int (gst_pad_link (pad, sink_pad), GST_PAD_LINK_OK);
+  gst_object_unref (sink_pad);
+  g_mutex_lock (&played->mutex);
+  played->pads++;
+  g_mutex_unlock (&played->mutex);
+}
+
+static void
+count_played_update_end (GstSourceBuffer * source_buffer, PlayedMedia * played)
+{
+  g_mutex_lock (&played->mutex);
+  played->update_end++;
+  g_cond_broadcast (&played->cond);
+  g_mutex_unlock (&played->mutex);
+}
+
+/* Waits up to five seconds for `*count` to reach `target`, and returns it. */
+static guint
+await_played (PlayedMedia * played, const guint * count, const guint * target)
+{
+  gint64 deadline = g_get_monotonic_time () + 5 * G_TIME_SPAN_SECOND;
+  g_mutex_lock (&played->mutex);
+  while ((*count == 0 || *count < *target)
+      && g_cond_wait_until (&played->cond, &played->mutex, deadline)) {
+  }
+  guint result = *count;
+  g_mutex_unlock (&played->mutex);
+  return result;
+}
+
+GST_START_TEST (test_media_source_element_frees_played_media)
+{
+  /* Proves the media msesrc has played is freed once the pipeline, the
+   * media source and its source buffer are gone, instead of living on for
+   * as long as the process does. */
+  PlayedMedia played = { 0 };
+  g_mutex_init (&played.mutex);
+  g_cond_init (&played.cond);
+  played.live = g_hash_table_new (g_direct_hash, g_direct_equal);
+  played.pipeline = gst_pipeline_new (NULL);
+  GstElement *src = g_object_new (GST_TYPE_MSE_SRC, NULL);
+  gst_bin_add (GST_BIN (played.pipeline), src);
+  g_signal_connect (src, "pad-added", G_CALLBACK (play_into_fakesink), &played);
+  GstMediaSource *media_source = gst_media_source_new ();
+  gst_media_source_attach (media_source, GST_MSE_SRC (src));
+  fail_if (gst_element_set_state (played.pipeline, GST_STATE_PLAYING) ==
+      GST_STATE_CHANGE_FAILURE);
+
+  GError *error = NULL;
+  GstSourceBuffer *source_buffer =
+      gst_media_source_add_source_buffer (media_source, "video/mp4", &error);
+  g_assert_no_error (error);
+  g_signal_connect (source_buffer, "on-update-end",
+      G_CALLBACK (count_played_update_end), &played);
+  gchar *path = test_mp4_path ();
+  gchar *data;
+  gsize length;
+  fail_unless (g_file_get_contents (path, &data, &length, &error));
+  g_assert_no_error (error);
+  g_free (path);
+  fail_unless (gst_source_buffer_append_buffer (source_buffer,
+          gst_buffer_new_wrapped (data, length), &error));
+  g_assert_no_error (error);
+  const guint one = 1;
+  fail_unless_equals_int (await_played (&played, &played.update_end, &one), 1);
+  fail_unless (gst_media_source_end_of_stream (media_source,
+          GST_MEDIA_SOURCE_EOS_ERROR_NONE, &error));
+  g_assert_no_error (error);
+  fail_unless (await_played (&played, &played.eos, &played.pads) > 0);
+  fail_unless_equals_int (played.eos, played.pads);
+
+  gst_element_set_state (played.pipeline, GST_STATE_NULL);
+  gst_media_source_detach (media_source);
+  gst_object_unref (played.pipeline);
+
+  /* Each track feed holds a reference to the source buffer until it has
+   * pushed its end of stream, and the media source let go of its own when
+   * it was detached: wait for this test's to be the last, so that the
+   * source buffer is freed here rather than on a feed's thread. */
+  gint64 deadline = g_get_monotonic_time () + 5 * G_TIME_SPAN_SECOND;
+  while (GST_OBJECT_REFCOUNT_VALUE (source_buffer) > 1
+      && g_get_monotonic_time () < deadline) {
+    g_usleep (G_TIME_SPAN_MILLISECOND);
+  }
+  fail_unless_equals_int (GST_OBJECT_REFCOUNT_VALUE (source_buffer), 1);
+  g_signal_handlers_disconnect_by_data (source_buffer, &played);
+  gst_object_unref (source_buffer);
+  gst_object_unref (media_source);
+
+  fail_unless (played.pushed > 0, "msesrc pushed no media");
+  fail_unless_equals_int (await_played (&played, &played.freed,
+          &played.pushed), played.pushed);
+
+  g_hash_table_unref (played.live);
+  g_mutex_clear (&played.mutex);
+  g_cond_clear (&played.cond);
+}
+
+GST_END_TEST;
+
 /* Formats every message, as a log function printing it would. */
 static void
 format_debug_message (GstDebugCategory * category, GstDebugLevel level,
@@ -1237,6 +1397,8 @@ mse_suite (void)
       test_clear_live_seekable_range_on_opened_media_source);
   tcase_add_test (tc_media_source,
       test_media_source_element_seeks_with_debug_output);
+  tcase_add_test (tc_media_source,
+      test_media_source_element_frees_played_media);
   tcase_add_loop_test (tc_media_source,
       test_media_source_unsupported_content_type,
       0, G_N_ELEMENTS (unsupported_content_types));
