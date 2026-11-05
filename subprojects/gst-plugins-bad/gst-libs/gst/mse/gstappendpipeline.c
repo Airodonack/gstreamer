@@ -87,6 +87,11 @@ struct _GstAppendPipeline
   GstBus *bus;
 
   GstStreamCollection *streams;
+  /* The collection the last init segment report was made for. The report
+   * can be reached from the stream-collection message on the bus task and
+   * from each pad-added on the streaming thread, whichever last finds all
+   * tracks present; both must not report the same init segment. */
+  GstStreamCollection *reported_streams;
   GArray *tracks;
   /* The tracks of the init segments before the last reset that no init
    * segment since has taken back. The source buffer keeps its track buffers
@@ -679,6 +684,14 @@ process_init_segment (GstAppendPipeline * self)
     goto done;
   }
 
+  if (self->streams == self->reported_streams) {
+    GST_DEBUG_OBJECT (self, "init segment already reported for %"
+        GST_PTR_FORMAT, self->streams);
+    goto done;
+  }
+  gst_clear_object (&self->reported_streams);
+  self->reported_streams = gst_object_ref (self->streams);
+
   if (gst_element_query_duration (self->parsebin, GST_FORMAT_TIME, &duration)) {
     init_segment->duration = MAX (0, duration);
   } else {
@@ -833,6 +846,7 @@ gst_append_pipeline_finalize (GObject * object)
   g_array_free (self->tracks, TRUE);
   g_ptr_array_unref (self->retired_tracks);
   gst_clear_object (&self->streams);
+  gst_clear_object (&self->reported_streams);
 
   g_mutex_clear (&self->init_segment_lock);
   g_mutex_clear (&self->appends_lock);
@@ -1005,6 +1019,7 @@ gst_append_pipeline_reset (GstAppendPipeline * self)
   init_segment_finalize (&old_init_segment);
 
   gst_clear_object (&self->streams);
+  gst_clear_object (&self->reported_streams);
   g_array_free (self->tracks, TRUE);
 
   self->have_outstanding_samples = FALSE;

@@ -870,6 +870,47 @@ GST_START_TEST (test_append_pipeline_webm)
 
 GST_END_TEST;
 
+typedef struct
+{
+  AppendPipelineTestContext base;
+  gint init_segments;
+} TracksTestContext;
+
+static void
+count_init_segment (GstAppendPipeline * pipeline, gpointer user_data)
+{
+  TracksTestContext *context = user_data;
+  g_atomic_int_inc (&context->init_segments);
+}
+
+GST_START_TEST (test_append_pipeline_init_segment_reported_once)
+{
+  /* Proves the initialization segment of bytes with no demuxer, here ADTS
+   * AAC, is reported once. The report is reached from pad-added on the
+   * streaming thread and from the stream-collection message on the bus
+   * task, whichever finds the last track present; when both do, the second
+   * must not report again. */
+  TracksTestContext context = { 0 };
+  GstAppendPipelineCallbacks callbacks = {
+    .received_init_segment = count_init_segment,
+    .eos = test_append_pipeline_eos,
+    .error = test_append_pipeline_error,
+  };
+  GstAppendPipeline *pipeline =
+      gst_append_pipeline_new (&callbacks, &context, NULL);
+
+  fail_unless (gst_append_pipeline_append (pipeline,
+          test_file_buffer ("mse-aac.adts")) == GST_FLOW_OK);
+  gst_append_pipeline_eos (pipeline);
+  test_append_pipeline_await_eos (pipeline, &context.base);
+  fail_if (gst_append_pipeline_get_failed (pipeline));
+  fail_unless_equals_int (g_atomic_int_get (&context.init_segments), 1);
+
+  gst_object_unref (pipeline);
+}
+
+GST_END_TEST;
+
 static GstAppendPipeline *
 failed_append_pipeline (GstAppendPipelineCallbacks * callbacks,
     AppendPipelineTestContext * context)
@@ -2085,6 +2126,8 @@ mse_suite (void)
   tcase_add_test (tc_append_pipeline, test_append_pipeline_create_and_free);
   tcase_add_test (tc_append_pipeline, test_append_pipeline_mp4);
   tcase_add_test (tc_append_pipeline, test_append_pipeline_webm);
+  tcase_add_test (tc_append_pipeline,
+      test_append_pipeline_init_segment_reported_once);
   tcase_add_test (tc_append_pipeline,
       test_append_pipeline_invalid_data_triggers_eos);
   tcase_add_test (tc_append_pipeline,
