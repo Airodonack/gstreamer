@@ -1,580 +1,97 @@
-# GStreamer
+> One change of the GStreamer fork: `review/06`, 6 of 33 in the stack.
+> Below it: [`review/05`](https://github.com/Airodonack/gstreamer/tree/review/05). Above it: [`review/07`](https://github.com/Airodonack/gstreamer/tree/review/07).
+> The change itself: [commit 868ad76ab363112e4ee591c571a16a3443cc5a8b](https://github.com/Airodonack/gstreamer/commit/868ad76ab363112e4ee591c571a16a3443cc5a8b). This README sits in a commit on top of it and is not part of the merge request.
+> The whole stack: [overview README](https://github.com/Airodonack/gstreamer/blob/mse-fixes-main/README.md).
 
-This is GStreamer, a framework for streaming media.
+# A reset append pipeline accepts an initialization segment again
 
-## Where to start
+After an append pipeline was reset, the next initialization segment crashed
+the whole application. Upstream, a reset follows every parse error. Later in
+this stack `abort()` resets too, so every abort followed by a new
+initialization segment would crash. The fix removes the old tracks' appsinks
+during the reset.
 
-We have a website at
+## The problem
 
-  https://gstreamer.freedesktop.org
+An append pipeline is `appsrc ! parsebin`, with one `appsink` per track that
+parsebin exposes. Each appsink is named after its stream type and index,
+`video-0`, `audio-1` and so on
+([`new_appsink()`](https://github.com/Airodonack/gstreamer/blob/868ad76ab363112e4ee591c571a16a3443cc5a8b/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L380-L393)).
 
-Our documentation, including tutorials, API reference and FAQ can be found at
+[`gst_append_pipeline_reset()` on main](https://github.com/Airodonack/gstreamer/blob/74f679f8de/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L861-L902)
+frees the tracks array but leaves the old appsinks in the bin. The next
+initialization segment's tracks get the same names again. In
+[`add_track()`](https://github.com/Airodonack/gstreamer/blob/868ad76ab363112e4ee591c571a16a3443cc5a8b/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L466-L477):
 
-  https://gstreamer.freedesktop.org/documentation/
+1. `gst_bin_add()` refuses an element whose name is taken. It also sinks and
+   unrefs the element it refuses
+   ([gstbin.c on main, lines 1378 to 1387](https://github.com/Airodonack/gstreamer/blob/74f679f8de/subprojects/gstreamer/gst/gstbin.c#L1378-L1387)),
+   so the new appsink is freed right there.
+2. `add_track()` ignores the result and goes on using the freed appsink: it
+   syncs its state, takes its pad and links it.
+3. Either that use of freed memory crashes, or the link fails, since the
+   appsink has no parent, and `add_track()` calls `g_error()`, which aborts the
+   process.
 
-You can ask questions on the GStreamer Discourse at
-
-  https://discourse.gstreamer.org/
-
-We track bugs, feature requests and merge requests (patches) in GitLab at
-
-  https://gitlab.freedesktop.org/gstreamer/
-
-You can join us on our Matrix room at
-
-  https://matrix.to/#/#gstreamer:gstreamer.org
-
-This repository contains all official modules supported by the GStreamer
-community which can be found in the `subprojects/` directory.
-
-## Getting started
-
-### Install git and python 3.8+
-
-If you're on Linux, you probably already have these. On macOS, new versions of
-Xcode ship Python 3 already. If you're on an older Xcode, you can use the
-[official Python installer](https://www.python.org/downloads/mac-osx/).
-
-You can find [instructions for Windows below](#windows-development-environment).
-
-### Install meson and ninja
-
-Meson 1.4 or newer is required.
-
-On Linux and macOS you can get meson through your package manager or using:
-
-```
-$ pip3 install --user meson
+```mermaid
+flowchart LR
+    R["reset<br/>tracks freed,<br/>appsink video-0 left in the bin"] --> I["next init segment<br/>new appsink video-0"]
+    I --> B["gst_bin_add refuses the name<br/>and frees the new appsink"]
+    B --> U["add_track uses it anyway"]
+    U --> C1["segfault"]
+    U --> C2["link fails, g_error aborts"]
 ```
 
-This will install meson into `~/.local/bin` which may or may not be included
-automatically in your PATH by default.
-
-You should get `ninja` using your package manager or download the [official
-release](https://github.com/ninja-build/ninja/releases) and put the `ninja`
-binary in your PATH.
-
-You can find [instructions for Windows below](#windows-development-environment).
-
-
-If you used the official Python installer on macOS instead of the Python
-3 shipped with Xcode, you might need to execute "Install Certificates.command"
-from the Python folder in the user Applications folder:
-
-```
-$ /Applications/Python\ 3.*/Install\ Certificates.command
-```
-
-Otherwise you will get this error when downloading meson wraps:
-
-```
-urllib.error.URLError: urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed
-```
-
-### Build GStreamer and its modules
-
-You can get all GStreamer built running:
-
-```
-meson setup builddir
-meson compile -C builddir
-```
-
-This will automatically create the `builddir` directory and build everything
-inside it.
-
-NOTE: On Windows, meson will automatically detect and use the latest Visual
-Studio if GCC, clang, etc are not available in `PATH`. Use the `--vsenv`
-argument to force the use of Visual Studio.
-
-NOTE: Meson will not update subprojects automatically once a subproject has
-been fetched. Remember to update subprojects if wrap files are updated.
-
-```
-meson subprojects update
-```
-
-### External dependencies
-
-All mandatory dependencies of GStreamer are included as [meson subprojects](https://mesonbuild.com/Subprojects.html):
-libintl, zlib, libffi, glib. Some optional dependencies are also included as
-subprojects, such as ffmpeg, x264, json-glib, graphene, openh264, orc, etc.
-
-Mandatory dependencies will be automatically built if meson cannot find them on
-your system using pkg-config. The same is true for optional dependencies that
-are included as subprojects. You can find a full list by looking at the
-`subprojects` directory.
-
-Plugins that need optional dependencies that aren't included can only be built
-if they are provided by the system. Instructions on how to build some common
-ones such as Qt5/QML are listed below. If you do not know how to provide an
-optional dependency needed by a plugin, you should use [Cerbero](https://gitlab.freedesktop.org/gstreamer/cerbero/#description)
-which handles this for you automatically.
-
-Plugins will be automatically enabled if possible, but you can ensure that
-a particular plugin (especially if it has external dependencies) is built by
-enabling the gstreamer repository that ships it and the plugin inside it. For
-example, to enable the Qt5 plugin in the gst-plugins-good repository, you need
-to run meson as follows:
-
-```
-meson -Dgood=enabled -Dgst-plugins-good:qt5=enabled builddir
-```
-
-This will cause Meson to error out if the plugin could not be enabled. You can
-also flip the default and disable all plugins except those explicitly enabled
-like so:
-
-```
-meson -Dauto_features=disabled -Dgstreamer:tools=enabled -Dbad=enabled -Dgst-plugins-bad:openh264=enabled
-```
-
-This will disable all optional features and then enable the `openh264` plugin
-and the tools that ship with the core gstreamer repository: `gst-inspect-1.0`,
-`gst-launch-1.0`, etc. As usual, you can change these values on a builddir that
-has already been setup with `meson configure -Doption=value`.
-
-### Building the Qt5 QML plugin
-
-If `qmake` is not in `PATH` and pkgconfig files are not available, you can
-point the `QMAKE` env var to the Qt5 installation of your choosing before
-running `meson` as shown above.
-
-The plugin will be automatically enabled if possible, but you can ensure that
-it is built by passing `-Dgood=enabled -Dgst-plugins-good:qt5=enabled` to `meson`.
-
-### Building the Intel MSDK plugin
-
-On Linux, you need to have development files for `libmfx` installed. On
-Windows, if you have the [Intel Media SDK](https://software.intel.com/en-us/media-sdk),
-it will set the `INTELMEDIASDKROOT` environment variable, which will be used by
-the build files to find `libmfx`.
-
-The plugin will be automatically enabled if possible, but you can ensure it by
-passing `-Dbad=enabled -Dgst-plugins-bad:msdk=enabled` to `meson`.
-
-### Building plugins with (A)GPL-licensed dependencies
-
-Some plugins have GPL- or AGPL-licensed dependencies and will only be built
-if you have explicitly opted in to allow (A)GPL-licensed dependencies by
-passing `-Dgpl=enabled` to Meson.
-
-List of plugins with (A)GPL-licensed dependencies (non-exhaustive) in gst-plugins-bad:
- - dts (DTS audio decoder plugin)
- - faad (Free AAC audio decoder plugin)
- - iqa (Image quality assessment plugin based on dssim-c)
- - mpeg2enc (MPEG-2 video encoder plugin)
- - mplex (audio/video multiplexer plugin)
- - ofa (Open Fingerprint Architecture library plugin)
- - resindvd (Resin DVD playback plugin)
- - x265 (HEVC/H.265 video encoder plugin)
-
-List of plugins with (A)GPL-licensed dependencies (non-exhaustive) in gst-plugins-ugly:
- - a52dec (Dolby Digital (AC-3) audio decoder plugin)
- - cdio (CD audio source plugin based on libcdio)
- - dvdread (DVD video source plugin based on libdvdread)
- - mpeg2dec (MPEG-2 video decoder plugin based on libmpeg2)
- - sidplay (Commodore 64 audio decoder plugin based on libsidplay)
- - x264 (H.264 video encoder plugin based on libx264)
-
-### Static build
-
-Since *1.18.0*, when doing a static build using `--default-library=static`,
-a shared library `gstreamer-full-1.0`, in addition to a package config file,
-will be produced and includes all enabled GStreamer plugins and libraries.
-A list of libraries that needs to be exposed in `gstreamer-full-1.0`
-ABI can be set using `gst-full-libraries` option.
-glib-2.0, gobject-2.0 and gstreamer-1.0 are always included.
-
-```
-meson setup --default-library=static -Dgst-full-libraries=gstreamer-app-1.0,gstreamer-video-1.0 builddir
-```
-
-GStreamer *1.18* requires applications using gstreamer-full-1.0 to initialize
-static plugins by calling `gst_init_static_plugins()` after `gst_init()`. That
-function is defined in `gst/gstinitstaticplugins.h` header file.
-
-Since *1.20.0*, `gst_init_static_plugins()` is called automatically by
-`gst_init()` and applications don't have to call it manually any more.
-The header file has been removed from public API.
-
-One can use the `gst-full-version-script` option to pass a
-[version script](https://www.gnu.org/software/gnulib/manual/html_node/LD-Version-Scripts.html)
-to the linker. This can be used to control the exact symbols that are exported by
-the `gstreamer-full` library, allowing the linker to garbage collect unused code
-and so, reduce the total library size. A default script
-`gstreamer-full-default.map` declares only glib/gstreamer symbols as public.
-
-One can use the `gst-full-plugins` option to pass a list of plugins to be
-registered in the `gstreamer-full` library. The default value is '*'
-which means that all the plugins selected during the build process will be
-registered statically.
-An empty value will prevent any plugins to be registered.
-
-One can select a specific set of features with `gst-full-elements`,
-`gst-full-typefind-functions`, `gst-full-device-providers`
-or `gst-full-dynamic-types` to select specific feature from a plugin.
-When a feature has been listed in one of those options, the other features from
-its plugin will no longer be automatically included, even if the plugin
-is listed in `gst-full-plugins`.
-
-The user must insure that all selected plugins and features (element,
-typefind, etc.) have been enabled during the build configuration.
-
-To register features, the syntax is the following:
-plugins are separated by ';' and features from a plugin starts after ':'
-and are ',' separated.
-
-As an example:
-
- * `-Dgst-full-plugins=coreelements;typefindfunctions;alsa;pbtypes`:
- Enable only `coreelements`, `typefindfunctions`, `alsa`, `pbtypes` plugins.
- * `-Dgst-full-elements=coreelements:filesrc,fakesink,identity;alsa:alsasrc`:
- Enable only `filesrc`, `identity` and `fakesink` elements from `coreelements`
- plugin and `alsasrc` element from `alsa` plugin.
- * `-Dgst-full-typefind-functions=typefindfunctions:wav,flv`:
- Enable only typefind func `wav` and `flv` from `typefindfunctions`
- * `-Dgst-full-device-providers=alsa:alsadeviceprovider`:
- Enable `alsadeviceprovider` from `alsa` plugin.
- * `-Dgst-full-dynamic-types=pbtypes:video_multiview_flagset`:
- Enable `video_multiview_flagset` from `pbtypes`.
-
-All features from the `playback` plugin will be enabled and the other plugins
-will be restricted to the specific features requested.
-
-All the selected features will be registered into a dedicated `NULL`
-plugin name.
-
-This will cause the features/plugins that are not registered to not be included
-in the final gstreamer-full library.
-
-This is an experimental feature, backward incompatible changes could still be
-made in the future.
-Only linux-like platforms are currently well supported when Windows, MSVC
-and MinGW, should be considered as *experimental* as the symbols export
-is still under discussion.
-
-Since 1.24.7, it is possible to disable the `gstreamer-full` library by passing
-`-Dgst-full=disabled`. This can be useful in cases where you want a static
-build of gstreamer, but you do not want to use gst-full, since linking the
-static executables associated with it can be quite CPU/RAM intensive.
-
-
-#### Full-static build
-
-Since *1.24.0*, it is also possible to link an application with GStreamer
-statically. It means that all the gstreamer libraries will be linked within
-your library or application. However, it is important to note that even though
-the `gstreamer-full` library can be statically built into the application,
-it does not contain all of the code (core libraries and plugins).
-Instead, it relies on all the other static libraries. Hence, while the
-`gstreamer-full` library provides a cohesive access point, the actual
-functionality is distributed across various static libraries.
-You can enable this option using `-Dgst-full-target-type=static_library` which
-is by default set to `shared_library`. The buildsystem will produce a set of
-archives depending on your `gstreamer-full` configuration as explained above.
-Your application can now check the `gstreamer-full` dependency within meson or
-with the package config file.
-In both case, the application can rely on the `gstreamer-full-1.0.pc` file
-generated during the build process to retrieve all its dependencies.
-In that configuration, the *features* selected during the build configuration
-will be automatically registered during the call of `gst_init()`.
-
-
-### Building documentation
-
-Documentation is not built by default because it is slow to generate. To build
-the documentation, first ensure that `hotdoc` is installed and `doc` option is
-enabled. For API documentation, gobject introspection must also be enabled.
-The special target `gst-doc` can then be used to (re)generate the documentation.
-
-```sh
-$ pip install hotdoc
-$ meson setup -Ddoc=enabled -Dintrospection=enabled builddir
-$ meson compile -C builddir gst-doc
-```
-
-NOTE: To visualize the documentation, `devhelp` can be run inside the development
-environment (see below).
-
-## Development environment
-
-### Development environment target
-
-GStreamer uses [Meson devenv](https://mesonbuild.com/Commands.html#devenv)
-to drop you into a development environment where all the plugins, libraries,
-and tools you just built are available:
-
-```
-meson devenv -C <BUILDDIR>
-```
-
-Alternatively, if you'd rather not start a shell in your workflow, you
-can mutate the current environment into a suitable state like so:
-
-```
-meson devenv -C <BUILDDIR> --dump
-```
-
-This will print output suitable for an sh-compatible `eval` function,
-just like `ssh-agent -s`.
-
-An external script can be run in development environment with:
-
-```
-meson devenv -C <BUILDDIR> external_script.sh
-```
-
-NOTE: In the development environment, a fully usable prefix is also configured
-in `gstreamer/prefix` where you can install any extra dependency/project.
-
-For more extensive documentation about the development environment go to [the
-documentation](https://gstreamer.freedesktop.org/documentation/installing/building-from-source-using-meson.html).
-
-### Bash prompt
-
-We automatically handle `bash` and set `$PS1` accordingly.
-
-If the automatic `$PS1` override is not desired (maybe you have a fancy custom
-prompt), set the `$MESON_DISABLE_PS1_OVERRIDE` environment variable to
-`TRUE` and use `$GST_ENV` when setting the custom prompt, for example with a
-snippet like the following:
-
-```bash
-...
-if [[ -n "${GST_ENV-}" ]];
-then
-  PS1+="[ ${GST_ENV} ]"
-fi
-...
-```
-
-## Windows Development Environment
-
-### Prerequisites
-
-- **Visual Studio Community 2022** (or later) with:
-  - Desktop development with C++ workload
-  - Windows SDK
-- **Python 3.8+** (required for build system and gst-env.py)
-- **Meson 1.4.0+** (install via pip: `pip install meson`)
-
-It is recommended to use Visual Studio Community 2022 and PowerShell terminal.
-
-Meson automatically detects and activates the Visual Studio toolchain when no other compilers are found.
-GStreamer should be built in a PowerShell environment for a complete user experience.
-
-NOTE: If you have other toolchains (MinGW, Clang, etc.) in your PATH, Meson may detect those instead of Visual Studio. To ensure Visual Studio is used:
-- Remove conflicting toolchains from your Windows PATH, or
-- Use the `--vsenv` flag: `meson setup --vsenv builddir`, or
-- Run from a Developer PowerShell for VS 2022 which pre-configures the environment
-
-#### Git for Windows
-
-Use the [Git for Windows](https://gitforwindows.org/) installer. It will
-install a `bash` prompt with basic shell utils and up-to-date git binaries.
-
-During installation, when prompted about `PATH`, you should select the
-following option:
-
-![Select "Git from the command line and also from 3rd-party software"](/data/images/git-installer-PATH.png)
-
-#### Python 3.8+ on Windows
-
-Use the [official Python installer](https://www.python.org/downloads/windows/).
-You must ensure that Python is installed into `PATH`:
-
-![Enable Add Python to PATH, then click Customize Installation](/data/images/py-installer-page1.png)
-
-You may also want to customize the installation and install it into
-a system-wide location such as `C:\PythonXY`, but this is not required.
-
-#### Ninja on Windows
-
-If you are using Visual Studio 2019 or newer, Ninja is already provided.
-
-In other cases, the easiest way to install Ninja on Windows is with `pip3`,
-which will download the compiled binary and place it into the `Scripts`
-directory inside your Python installation:
-
-```
-pip3 install ninja
-```
-
-You can also download the [official release](https://github.com/ninja-build/ninja/releases)
-and place it into `PATH`, or use MSYS2.
-
-#### Meson on Windows
-
-**IMPORTANT**: Do not use the Meson MSI installer since it is experimental and known to not
-work with `GStreamer`.
-
-You can use `pip3` to install Meson, same as Ninja above:
-
-```
-pip3 install meson
-```
-
-Note that Meson is written entirely in Python, so you can also run it as-is
-from the [git repository](https://github.com/mesonbuild/meson/) if you want to
-use the latest master branch for some reason.
-
-### Running Meson on Windows
-
-Meson automatically activates the Visual Studio environment on Windows if no
-other compilers (gcc, clang, etc) are found. To force the use of Visual Studio
-in such cases, you can use:
-
-```
-meson setup --vsenv builddir
-```
-
-### Building with Visual Studio
-
-```powershell
-meson setup builddir
-meson compile -C builddir
-```
-
-NOTE: You should verify that Visual Studio is being detected. Look for output similar to:
-
-```powershell
-...
-Activating VS 17.x.x
-...
-```
-
-### Powerline devenv prompt
-
-In your powerline theme configuration file (by default in
-`{POWERLINE INSTALLATION DIR}/config_files/themes/shell/default.json`)
-you should add a new environment segment as follow:
-
-```
-{
-  "function": "powerline.segments.common.env.environment",
-  "args": { "variable": "GST_ENV" },
-  "priority": 50
-},
-```
-
-## Custom subprojects
-
-We also added a meson option, `custom_subprojects`, that allows the user
-to provide a comma-separated list of meson subprojects that should be built
-alongside the default ones.
-
-To use it:
-
-```sh
-# Clone into the subprojects directory
-$ git -C subprojects clone my_subproject
-# Wipe dependency detection state, in case you have an existing build dir
-$ meson setup --wipe builddir -Dcustom_subprojects=my_subproject
-$ meson compile -C builddir
-```
-
-## Run tests
-
-You can easily run the test of all the components:
-
-```
-meson test -C builddir
-```
-
-To list all available tests:
-
-```
-meson test -C builddir --list
-```
-
-To run all the tests of a specific component:
-
-```
-meson test -C builddir --suite gst-plugins-base
-```
-
-Or to run a specific test file:
-
-```
-meson test -C builddir --suite gstreamer gst_gstbuffer
-```
-
-Run a specific test from a specific test file:
-
-```
-GST_CHECKS=test_subbuffer meson test -C builddir --suite gstreamer gst_gstbuffer
-```
-
-## Optional Installation
-
-You can also install everything that is built into a predetermined prefix like
-so:
-
-```
-meson setup --prefix=/path/to/install/prefix builddir
-meson compile -C builddir
-meson install -C builddir
-```
-
-Note that the installed files have `RPATH` stripped, so you will need to set
-`LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, or `PATH` as appropriate for your
-platform for things to work.
-
-## Setup a mingw/wine based development environment on linux
-
-### Install wine and mingw
-
-#### On fedora x64
-
-``` sh
-sudo dnf install mingw64-gcc mingw64-gcc-c++ mingw64-pkg-config mingw64-winpthreads wine
-```
-
-FIXME: Figure out what needs to be installed on other distros
-
-### Get meson from git
-
-This simplifies the process and allows us to use the cross files
-defined in meson itself.
-
-``` sh
-git clone https://github.com/mesonbuild/meson.git
-```
-
-### Build and install
-
-```
-BUILDDIR=$PWD/winebuild/
-export WINEPREFIX=$BUILDDIR/wine-prefix/ && mkdir -p $WINEPREFIX
-# Setting the prefix is mandatory as it is used to setup symlinks within the development environment
-meson/meson.py $BUILDDIR --cross-file meson/cross/linux-mingw-w64-64bit.txt -Dgst-plugins-bad:vulkan=disabled -Dorc:gtk_doc=disabled --prefix=$BUILDDIR/wininstall/ -Djson-glib:gtk_doc=disabled
-meson/meson.py install -C $BUILDDIR/
-```
-
-> __NOTE__: You should use `meson install -C $BUILDDIR`  each time you make a change
-> instead of the usual `meson compile -C $BUILDDIR` as this is not in the
-> development environment.
-
-Alternatively, you can also use `mingw64-meson` on Fedora, which is a wrapper
-script that sets things up to use Fedora's cross files and settings. However,
-the wrapper script can be buggy in some cases.
-
-### cross-mingw development environment
-
-You can get into the development environment as described [above](#development-environment).
-
-After setting up [binfmt] to use wine for windows binaries,
-you can run GStreamer tools under wine by running:
-
-```
-gst-launch-1.0.exe videotestsrc ! glimagesink
-```
-
-[binfmt]: http://man7.org/linux/man-pages/man5/binfmt.d.5.html
-
-## vscode integration
-
-A file named `.vscode/launch.json.sample` can be used as a reference to debug and run
-GStreamer applications such as `gst-launch-1.0`. You just have to copy the file to
-`.vscode/launch.json` to enable the debugging session in Visual Studio Code.
+## The change
+
+Before the reset frees the tracks array, it takes each old appsink out of the
+pipeline
+([gstappendpipeline.c, lines 878 to 895](https://github.com/Airodonack/gstreamer/blob/868ad76ab363112e4ee591c571a16a3443cc5a8b/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L878-L895)):
+unlink it from its source pad if linked, set it to `NULL`, and remove it from
+the bin. The pipeline is already in `READY` and its background task stopped at
+this point, so no sample is in flight.
+
+Each `Track` holds its own references to its appsink and pad, which
+[`clear_track()`](https://github.com/Airodonack/gstreamer/blob/868ad76ab363112e4ee591c571a16a3443cc5a8b/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L498-L505)
+drops when the array is freed, so removing the sink from the bin leaves the
+reference counts balanced.
+
+## Options considered
+
+| Option | What it would take | Why not chosen |
+|---|---|---|
+| **Remove the old appsinks in the reset** (this change) | 19 lines in the reset | Chosen: the reset already drops everything else of the old tracks. The pipeline after a reset then looks like a new one. |
+| Unique appsink names, with a counter | Change `new_appsink()` | The old sinks would pile up in the pipeline, one set per reset. Track ids, which are the appsink names, would also change on every reset, and later changes in this stack rely on them repeating. |
+| Check `gst_bin_add()`'s result and report a parse error | A few lines in `add_track()` | Turns the crash into an error, but the reset pipeline still could not take a new initialization segment. Worth doing as well. Not done here. |
+| Build a whole new append pipeline on reset | Larger change | More state to rebuild and hand over: callbacks, bus task, appsrc. |
+
+## How it was checked
+
+Unit test
+[`test_append_pipeline_reset_after_init_segment`](https://github.com/Airodonack/gstreamer/blob/868ad76ab363112e4ee591c571a16a3443cc5a8b/subprojects/gst-plugins-bad/tests/check/libs/mse.c#L822-L848)
+appends an MP4 with three tracks, waits for its EOS, resets, and does it a
+second time. It checks that the pipeline did not fail and has three tracks
+after each round.
+
+- Before the change (run of 2026-10-23, the same test text): "Received signal
+  11 (Segmentation fault)" in this test.
+- After: passes. Re-run for this README on a build of the stack's top of that day
+  (2026-11-03): 5 of 5 runs pass.
+- It was first seen as a browser crash in that `g_error()` during a
+  web-platform-tests media-source run.
+
+The parse error path that triggers the reset upstream has other problems:
+errors reported twice, a reset run on the thread it joins. They are fixed in
+`review/12` and `review/14`.
+
+At this commit, the gate on GStreamer main (2026-11-05) ran the whole unit
+test suite: `100%: Checks: 71, Failures: 0, Errors: 0`, as on the 1.28 series.
+
+## Questions a reviewer may ask
+
+- **Why can `track->sink` be `NULL`?** It cannot for a track `add_track()`
+  added. The check costs nothing and keeps the loop safe if a track is ever
+  stored half-built.
+- **Why unlink before removing?** `gst_bin_remove()` unlinks the element's pads
+  too. The explicit unlink makes the order clear and is harmless when already
+  unlinked.
