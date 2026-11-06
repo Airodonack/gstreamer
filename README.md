@@ -1,580 +1,233 @@
-# GStreamer
+> One change of the GStreamer fork: `review/12`, 12 of 33 in the stack.
+> Below it: [`review/11`](https://github.com/Airodonack/gstreamer/tree/review/11). Above it: [`review/13`](https://github.com/Airodonack/gstreamer/tree/review/13).
+> The change itself: [commit 09b309e2c62cd1e38fdcfa24151d86102bb8f3b8](https://github.com/Airodonack/gstreamer/commit/09b309e2c62cd1e38fdcfa24151d86102bb8f3b8). This README sits in a commit on top of it and is not part of the merge request.
+> The whole stack: [overview README](https://github.com/Airodonack/gstreamer/blob/mse-fixes-main/README.md).
 
-This is GStreamer, a framework for streaming media.
+# The parser is reset without the source buffer's lock
 
-## Where to start
+Resetting a source buffer's append pipeline ran under the source buffer's
+object lock, and the reset waits for threads that need that lock. This change
+moves the reset out from under the lock. Running it unlocked opens two new
+races, and the change closes both: two resets of the same pipeline at once,
+and a reset freeing track arrays another buffer is reading.
 
-We have a website at
+The next change, `review/13`, makes `abort()` reset the parser from the
+application's thread. This change settles the locking first.
 
-  https://gstreamer.freedesktop.org
+## The problem
 
-Our documentation, including tutorials, API reference and FAQ can be found at
+**1. The reset waits on a thread that waits on it.** A reset stops the append
+pipeline. That joins its streaming threads and its background task. The
+background task delivers samples through `on_new_sample()`, which takes the
+source buffer's object lock. Upstream, unchanged until this commit, the
+append error algorithm and `gst_source_buffer_teardown()` reset with that lock
+held
+([`reset_parser_state_unlocked()` and `append_error_unlocked()`](https://github.com/Airodonack/gstreamer/blob/74f679f8de/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c#L1643-L1671),
+[`gst_source_buffer_teardown()`](https://github.com/Airodonack/gstreamer/blob/74f679f8de/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c#L2167-L2174)).
 
-  https://gstreamer.freedesktop.org/documentation/
-
-You can ask questions on the GStreamer Discourse at
-
-  https://discourse.gstreamer.org/
-
-We track bugs, feature requests and merge requests (patches) in GitLab at
-
-  https://gitlab.freedesktop.org/gstreamer/
-
-You can join us on our Matrix room at
-
-  https://matrix.to/#/#gstreamer:gstreamer.org
-
-This repository contains all official modules supported by the GStreamer
-community which can be found in the `subprojects/` directory.
-
-## Getting started
-
-### Install git and python 3.8+
-
-If you're on Linux, you probably already have these. On macOS, new versions of
-Xcode ship Python 3 already. If you're on an older Xcode, you can use the
-[official Python installer](https://www.python.org/downloads/mac-osx/).
-
-You can find [instructions for Windows below](#windows-development-environment).
-
-### Install meson and ninja
-
-Meson 1.4 or newer is required.
-
-On Linux and macOS you can get meson through your package manager or using:
-
-```
-$ pip3 install --user meson
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as resetting thread
+    participant SB as source buffer lock
+    participant BG as append pipeline background task
+    R->>SB: lock
+    BG->>SB: on_new_sample, waits
+    R->>BG: reset, stop the pipeline, join
+    Note over R,BG: R waits for BG, BG waits for R
 ```
 
-This will install meson into `~/.local/bin` which may or may not be included
-automatically in your PATH by default.
+## The change, part 1: reset without the lock
 
-You should get `ninja` using your package manager or download the [official
-release](https://github.com/ninja-build/ninja/releases) and put the `ninja`
-binary in your PATH.
+[`reset_parser_state()`](https://github.com/Airodonack/gstreamer/blob/09b309e2c62cd1e38fdcfa24151d86102bb8f3b8/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c#L1655-L1673)
+now runs with no lock held, and takes the object lock only afterwards to set
+or clear the error flag. Its two callers drop what they need under the lock,
+then release it for the reset:
 
-You can find [instructions for Windows below](#windows-development-environment).
+- [`append_error_unlocked()`](https://github.com/Airodonack/gstreamer/blob/09b309e2c62cd1e38fdcfa24151d86102bb8f3b8/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c#L1675-L1699)
+  clears the pending data and `updating` and schedules error and update-end,
+  then unlocks, resets, and locks again.
+- [`gst_source_buffer_teardown()`](https://github.com/Airodonack/gstreamer/blob/09b309e2c62cd1e38fdcfa24151d86102bb8f3b8/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c#L2219-L2231)
+  does the same, then resets after unlocking.
 
+Both bump a new `append_generation` under the lock first. An append task
+waiting in `gst_append_pipeline_wait_for_appends()`, from `review/10`,
+records the number before it waits and reports nothing when the number has
+moved
+([lines 1810 to 1818](https://github.com/Airodonack/gstreamer/blob/09b309e2c62cd1e38fdcfa24151d86102bb8f3b8/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c#L1810-L1818)).
+Its append was discarded by the reset.
 
-If you used the official Python installer on macOS instead of the Python
-3 shipped with Xcode, you might need to execute "Install Certificates.command"
-from the Python folder in the user Applications folder:
+One caller of the append error algorithm is still wrong after this change:
+`on_error()` runs it on one of the append pipeline's own threads, where the
+reset joins that thread. `review/14` moves it to the append task.
 
-```
-$ /Applications/Python\ 3.*/Install\ Certificates.command
-```
-
-Otherwise you will get this error when downloading meson wraps:
-
-```
-urllib.error.URLError: urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed
-```
-
-### Build GStreamer and its modules
-
-You can get all GStreamer built running:
-
-```
-meson setup builddir
-meson compile -C builddir
-```
-
-This will automatically create the `builddir` directory and build everything
-inside it.
-
-NOTE: On Windows, meson will automatically detect and use the latest Visual
-Studio if GCC, clang, etc are not available in `PATH`. Use the `--vsenv`
-argument to force the use of Visual Studio.
-
-NOTE: Meson will not update subprojects automatically once a subproject has
-been fetched. Remember to update subprojects if wrap files are updated.
-
-```
-meson subprojects update
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as resetting thread
+    participant SB as source buffer lock
+    participant BG as append pipeline background task
+    R->>SB: lock, generation++, clear pending data, unlock
+    BG->>SB: on_new_sample, lock, unlock
+    R->>BG: reset, stop the pipeline, join
+    BG-->>R: joined
+    R->>SB: lock, set the error flag, unlock
 ```
 
-### External dependencies
+## The problem, part 2: two resets at once
 
-All mandatory dependencies of GStreamer are included as [meson subprojects](https://mesonbuild.com/Subprojects.html):
-libintl, zlib, libffi, glib. Some optional dependencies are also included as
-subprojects, such as ffmpeg, x264, json-glib, graphene, openh264, orc, etc.
+Without the object lock, two threads can reset the same append pipeline at
+once: the append task's error path and a teardown, and from `review/13` an
+`abort()` on the application's thread. `gst_append_pipeline_reset()` has no
+lock of its own. It walks and frees the pipeline's tracks, rebuilds
+`retired_tracks` and replaces the initialization segment. A second reset
+over the first removed the sinks and freed the tracks array under the other
+thread's loop.
 
-Mandatory dependencies will be automatically built if meson cannot find them on
-your system using pkg-config. The same is true for optional dependencies that
-are included as subprojects. You can find a full list by looking at the
-`subprojects` directory.
-
-Plugins that need optional dependencies that aren't included can only be built
-if they are provided by the system. Instructions on how to build some common
-ones such as Qt5/QML are listed below. If you do not know how to provide an
-optional dependency needed by a plugin, you should use [Cerbero](https://gitlab.freedesktop.org/gstreamer/cerbero/#description)
-which handles this for you automatically.
-
-Plugins will be automatically enabled if possible, but you can ensure that
-a particular plugin (especially if it has external dependencies) is built by
-enabling the gstreamer repository that ships it and the plugin inside it. For
-example, to enable the Qt5 plugin in the gst-plugins-good repository, you need
-to run meson as follows:
-
-```
-meson -Dgood=enabled -Dgst-plugins-good:qt5=enabled builddir
+```mermaid
+sequenceDiagram
+    autonumber
+    participant E as append task, error path
+    participant P as append pipeline
+    participant A as abort, application thread
+    E->>P: reset, walking the old tracks
+    A->>P: reset, removes the sinks, frees tracks
+    E->>P: next track, get_static_pad on a freed sink
+    Note over E: SIGSEGV or GST_IS_ELEMENT criticals
 ```
 
-This will cause Meson to error out if the plugin could not be enabled. You can
-also flip the default and disable all plugins except those explicitly enabled
-like so:
+## The change, part 2: one reset at a time
 
-```
-meson -Dauto_features=disabled -Dgstreamer:tools=enabled -Dbad=enabled -Dgst-plugins-bad:openh264=enabled
-```
+A `reset_lock` in `GstSourceBuffer` is held across
+`gst_append_pipeline_reset()` in `reset_parser_state()`. The callers take
+turns. It is taken with no other lock held, and the reset takes only the
+append pipeline's own locks, so it nests inside nothing.
 
-This will disable all optional features and then enable the `openh264` plugin
-and the tools that ship with the core gstreamer repository: `gst-inspect-1.0`,
-`gst-launch-1.0`, etc. As usual, you can change these values on a builddir that
-has already been setup with `meson configure -Doption=value`.
-
-### Building the Qt5 QML plugin
-
-If `qmake` is not in `PATH` and pkgconfig files are not available, you can
-point the `QMAKE` env var to the Qt5 installation of your choosing before
-running `meson` as shown above.
-
-The plugin will be automatically enabled if possible, but you can ensure that
-it is built by passing `-Dgood=enabled -Dgst-plugins-good:qt5=enabled` to `meson`.
-
-### Building the Intel MSDK plugin
-
-On Linux, you need to have development files for `libmfx` installed. On
-Windows, if you have the [Intel Media SDK](https://software.intel.com/en-us/media-sdk),
-it will set the `INTELMEDIASDKROOT` environment variable, which will be used by
-the build files to find `libmfx`.
-
-The plugin will be automatically enabled if possible, but you can ensure it by
-passing `-Dbad=enabled -Dgst-plugins-bad:msdk=enabled` to `meson`.
-
-### Building plugins with (A)GPL-licensed dependencies
-
-Some plugins have GPL- or AGPL-licensed dependencies and will only be built
-if you have explicitly opted in to allow (A)GPL-licensed dependencies by
-passing `-Dgpl=enabled` to Meson.
-
-List of plugins with (A)GPL-licensed dependencies (non-exhaustive) in gst-plugins-bad:
- - dts (DTS audio decoder plugin)
- - faad (Free AAC audio decoder plugin)
- - iqa (Image quality assessment plugin based on dssim-c)
- - mpeg2enc (MPEG-2 video encoder plugin)
- - mplex (audio/video multiplexer plugin)
- - ofa (Open Fingerprint Architecture library plugin)
- - resindvd (Resin DVD playback plugin)
- - x265 (HEVC/H.265 video encoder plugin)
-
-List of plugins with (A)GPL-licensed dependencies (non-exhaustive) in gst-plugins-ugly:
- - a52dec (Dolby Digital (AC-3) audio decoder plugin)
- - cdio (CD audio source plugin based on libcdio)
- - dvdread (DVD video source plugin based on libdvdread)
- - mpeg2dec (MPEG-2 video decoder plugin based on libmpeg2)
- - sidplay (Commodore 64 audio decoder plugin based on libsidplay)
- - x264 (H.264 video encoder plugin based on libx264)
-
-### Static build
-
-Since *1.18.0*, when doing a static build using `--default-library=static`,
-a shared library `gstreamer-full-1.0`, in addition to a package config file,
-will be produced and includes all enabled GStreamer plugins and libraries.
-A list of libraries that needs to be exposed in `gstreamer-full-1.0`
-ABI can be set using `gst-full-libraries` option.
-glib-2.0, gobject-2.0 and gstreamer-1.0 are always included.
-
-```
-meson setup --default-library=static -Dgst-full-libraries=gstreamer-app-1.0,gstreamer-video-1.0 builddir
+```mermaid
+sequenceDiagram
+    autonumber
+    participant E as append task, error path
+    participant L as reset_lock
+    participant P as append pipeline
+    participant A as abort, application thread
+    E->>L: lock
+    E->>P: reset, whole
+    A->>L: lock, waits
+    E->>L: unlock
+    A->>L: lock
+    A->>P: reset of the already reset pipeline
+    A->>L: unlock
 ```
 
-GStreamer *1.18* requires applications using gstreamer-full-1.0 to initialize
-static plugins by calling `gst_init_static_plugins()` after `gst_init()`. That
-function is defined in `gst/gstinitstaticplugins.h` header file.
+## The problem, part 3: another buffer reads the track arrays
 
-Since *1.20.0*, `gst_init_static_plugins()` is called automatically by
-`gst_init()` and applications don't have to call it manually any more.
-The header file has been removed from public API.
+When a buffer receives an initialization segment, the media source collects
+every buffer's tracks for msesrc
+([`on_received_init_segment()`](https://github.com/Airodonack/gstreamer/blob/09b309e2c62cd1e38fdcfa24151d86102bb8f3b8/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstmediasource.c#L705-L738)
+-> `gst_source_buffer_get_all_tracks()`). That runs on the receiving buffer's
+append pipeline thread, and reads the other buffers' tracks too.
+`gst_append_pipeline_get_{audio,text,video}_tracks()` handed out the
+pipeline's own `init_segment` arrays, with no lock and no copy. A reset of the
+other buffer frees those arrays. The media source's lock does not help: the
+reset takes no media source lock.
 
-One can use the `gst-full-version-script` option to pass a
-[version script](https://www.gnu.org/software/gnulib/manual/html_node/LD-Version-Scripts.html)
-to the linker. This can be used to control the exact symbols that are exported by
-the `gstreamer-full` library, allowing the linker to garbage collect unused code
-and so, reduce the total library size. A default script
-`gstreamer-full-default.map` declares only glib/gstreamer symbols as public.
-
-One can use the `gst-full-plugins` option to pass a list of plugins to be
-registered in the `gstreamer-full` library. The default value is '*'
-which means that all the plugins selected during the build process will be
-registered statically.
-An empty value will prevent any plugins to be registered.
-
-One can select a specific set of features with `gst-full-elements`,
-`gst-full-typefind-functions`, `gst-full-device-providers`
-or `gst-full-dynamic-types` to select specific feature from a plugin.
-When a feature has been listed in one of those options, the other features from
-its plugin will no longer be automatically included, even if the plugin
-is listed in `gst-full-plugins`.
-
-The user must insure that all selected plugins and features (element,
-typefind, etc.) have been enabled during the build configuration.
-
-To register features, the syntax is the following:
-plugins are separated by ';' and features from a plugin starts after ':'
-and are ',' separated.
-
-As an example:
-
- * `-Dgst-full-plugins=coreelements;typefindfunctions;alsa;pbtypes`:
- Enable only `coreelements`, `typefindfunctions`, `alsa`, `pbtypes` plugins.
- * `-Dgst-full-elements=coreelements:filesrc,fakesink,identity;alsa:alsasrc`:
- Enable only `filesrc`, `identity` and `fakesink` elements from `coreelements`
- plugin and `alsasrc` element from `alsa` plugin.
- * `-Dgst-full-typefind-functions=typefindfunctions:wav,flv`:
- Enable only typefind func `wav` and `flv` from `typefindfunctions`
- * `-Dgst-full-device-providers=alsa:alsadeviceprovider`:
- Enable `alsadeviceprovider` from `alsa` plugin.
- * `-Dgst-full-dynamic-types=pbtypes:video_multiview_flagset`:
- Enable `video_multiview_flagset` from `pbtypes`.
-
-All features from the `playback` plugin will be enabled and the other plugins
-will be restricted to the specific features requested.
-
-All the selected features will be registered into a dedicated `NULL`
-plugin name.
-
-This will cause the features/plugins that are not registered to not be included
-in the final gstreamer-full library.
-
-This is an experimental feature, backward incompatible changes could still be
-made in the future.
-Only linux-like platforms are currently well supported when Windows, MSVC
-and MinGW, should be considered as *experimental* as the symbols export
-is still under discussion.
-
-Since 1.24.7, it is possible to disable the `gstreamer-full` library by passing
-`-Dgst-full=disabled`. This can be useful in cases where you want a static
-build of gstreamer, but you do not want to use gst-full, since linking the
-static executables associated with it can be quite CPU/RAM intensive.
-
-
-#### Full-static build
-
-Since *1.24.0*, it is also possible to link an application with GStreamer
-statically. It means that all the gstreamer libraries will be linked within
-your library or application. However, it is important to note that even though
-the `gstreamer-full` library can be statically built into the application,
-it does not contain all of the code (core libraries and plugins).
-Instead, it relies on all the other static libraries. Hence, while the
-`gstreamer-full` library provides a cohesive access point, the actual
-functionality is distributed across various static libraries.
-You can enable this option using `-Dgst-full-target-type=static_library` which
-is by default set to `shared_library`. The buildsystem will produce a set of
-archives depending on your `gstreamer-full` configuration as explained above.
-Your application can now check the `gstreamer-full` dependency within meson or
-with the package config file.
-In both case, the application can rely on the `gstreamer-full-1.0.pc` file
-generated during the build process to retrieve all its dependencies.
-In that configuration, the *features* selected during the build configuration
-will be automatically registered during the call of `gst_init()`.
-
-
-### Building documentation
-
-Documentation is not built by default because it is slow to generate. To build
-the documentation, first ensure that `hotdoc` is installed and `doc` option is
-enabled. For API documentation, gobject introspection must also be enabled.
-The special target `gst-doc` can then be used to (re)generate the documentation.
-
-```sh
-$ pip install hotdoc
-$ meson setup -Ddoc=enabled -Dintrospection=enabled builddir
-$ meson compile -C builddir gst-doc
+```mermaid
+sequenceDiagram
+    autonumber
+    participant V as video pipeline thread<br/>init segment
+    participant AP as audio append pipeline
+    participant A as abort of the audio buffer
+    V->>AP: get_audio_tracks, its own array
+    A->>AP: reset, frees the array
+    V->>V: g_ptr_array_extend from the freed array
+    Note over V: SIGSEGV in g_ptr_array_extend
 ```
 
-NOTE: To visualize the documentation, `devhelp` can be run inside the development
-environment (see below).
+## The change, part 3: copies under a lock of their own
 
-## Development environment
+The append pipeline gets an `init_segment_lock` for its track arrays and its
+`received_init_segment` flag:
 
-### Development environment target
+- the streaming thread adds a track under it
+  ([lines 603 to 607](https://github.com/Airodonack/gstreamer/blob/09b309e2c62cd1e38fdcfa24151d86102bb8f3b8/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L600-L611));
+- `reset()` swaps in empty arrays under it and frees the old ones after
+  ([lines 997 to 1005](https://github.com/Airodonack/gstreamer/blob/09b309e2c62cd1e38fdcfa24151d86102bb8f3b8/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L997-L1005));
+- the getters copy the array under it, with a reference to each track
+  ([`copy_init_segment_tracks()` and the getters](https://github.com/Airodonack/gstreamer/blob/09b309e2c62cd1e38fdcfa24151d86102bb8f3b8/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L1061-L1098)).
 
-GStreamer uses [Meson devenv](https://mesonbuild.com/Commands.html#devenv)
-to drop you into a development environment where all the plugins, libraries,
-and tools you just built are available:
+It is never held while calling out. `gst_source_buffer_get_all_tracks()` and
+the media source's collection hold references too, and the source buffer's
+own initialization segment handler unrefs the copies.
 
-```
-meson devenv -C <BUILDDIR>
-```
-
-Alternatively, if you'd rather not start a shell in your workflow, you
-can mutate the current environment into a suitable state like so:
-
-```
-meson devenv -C <BUILDDIR> --dump
-```
-
-This will print output suitable for an sh-compatible `eval` function,
-just like `ssh-agent -s`.
-
-An external script can be run in development environment with:
-
-```
-meson devenv -C <BUILDDIR> external_script.sh
+```mermaid
+sequenceDiagram
+    autonumber
+    participant V as video pipeline thread<br/>init segment
+    participant AP as audio append pipeline
+    participant A as abort of the audio buffer
+    V->>AP: init_segment_lock, copy with refs, unlock
+    A->>AP: init_segment_lock, swap in empty arrays, unlock
+    A->>A: free the old arrays, tracks still referenced by V's copy
+    V->>V: extend from its copy, unref later
 ```
 
-NOTE: In the development environment, a fully usable prefix is also configured
-in `gstreamer/prefix` where you can install any extra dependency/project.
-
-For more extensive documentation about the development environment go to [the
-documentation](https://gstreamer.freedesktop.org/documentation/installing/building-from-source-using-meson.html).
-
-### Bash prompt
-
-We automatically handle `bash` and set `$PS1` accordingly.
-
-If the automatic `$PS1` override is not desired (maybe you have a fancy custom
-prompt), set the `$MESON_DISABLE_PS1_OVERRIDE` environment variable to
-`TRUE` and use `$GST_ENV` when setting the custom prompt, for example with a
-snippet like the following:
-
-```bash
-...
-if [[ -n "${GST_ENV-}" ]];
-then
-  PS1+="[ ${GST_ENV} ]"
-fi
-...
-```
-
-## Windows Development Environment
-
-### Prerequisites
-
-- **Visual Studio Community 2022** (or later) with:
-  - Desktop development with C++ workload
-  - Windows SDK
-- **Python 3.8+** (required for build system and gst-env.py)
-- **Meson 1.4.0+** (install via pip: `pip install meson`)
-
-It is recommended to use Visual Studio Community 2022 and PowerShell terminal.
-
-Meson automatically detects and activates the Visual Studio toolchain when no other compilers are found.
-GStreamer should be built in a PowerShell environment for a complete user experience.
-
-NOTE: If you have other toolchains (MinGW, Clang, etc.) in your PATH, Meson may detect those instead of Visual Studio. To ensure Visual Studio is used:
-- Remove conflicting toolchains from your Windows PATH, or
-- Use the `--vsenv` flag: `meson setup --vsenv builddir`, or
-- Run from a Developer PowerShell for VS 2022 which pre-configures the environment
-
-#### Git for Windows
-
-Use the [Git for Windows](https://gitforwindows.org/) installer. It will
-install a `bash` prompt with basic shell utils and up-to-date git binaries.
-
-During installation, when prompted about `PATH`, you should select the
-following option:
-
-![Select "Git from the command line and also from 3rd-party software"](/data/images/git-installer-PATH.png)
-
-#### Python 3.8+ on Windows
-
-Use the [official Python installer](https://www.python.org/downloads/windows/).
-You must ensure that Python is installed into `PATH`:
-
-![Enable Add Python to PATH, then click Customize Installation](/data/images/py-installer-page1.png)
-
-You may also want to customize the installation and install it into
-a system-wide location such as `C:\PythonXY`, but this is not required.
-
-#### Ninja on Windows
-
-If you are using Visual Studio 2019 or newer, Ninja is already provided.
-
-In other cases, the easiest way to install Ninja on Windows is with `pip3`,
-which will download the compiled binary and place it into the `Scripts`
-directory inside your Python installation:
-
-```
-pip3 install ninja
-```
-
-You can also download the [official release](https://github.com/ninja-build/ninja/releases)
-and place it into `PATH`, or use MSYS2.
-
-#### Meson on Windows
-
-**IMPORTANT**: Do not use the Meson MSI installer since it is experimental and known to not
-work with `GStreamer`.
-
-You can use `pip3` to install Meson, same as Ninja above:
-
-```
-pip3 install meson
-```
-
-Note that Meson is written entirely in Python, so you can also run it as-is
-from the [git repository](https://github.com/mesonbuild/meson/) if you want to
-use the latest master branch for some reason.
-
-### Running Meson on Windows
-
-Meson automatically activates the Visual Studio environment on Windows if no
-other compilers (gcc, clang, etc) are found. To force the use of Visual Studio
-in such cases, you can use:
-
-```
-meson setup --vsenv builddir
-```
-
-### Building with Visual Studio
-
-```powershell
-meson setup builddir
-meson compile -C builddir
-```
-
-NOTE: You should verify that Visual Studio is being detected. Look for output similar to:
-
-```powershell
-...
-Activating VS 17.x.x
-...
-```
-
-### Powerline devenv prompt
-
-In your powerline theme configuration file (by default in
-`{POWERLINE INSTALLATION DIR}/config_files/themes/shell/default.json`)
-you should add a new environment segment as follow:
-
-```
-{
-  "function": "powerline.segments.common.env.environment",
-  "args": { "variable": "GST_ENV" },
-  "priority": 50
-},
-```
-
-## Custom subprojects
-
-We also added a meson option, `custom_subprojects`, that allows the user
-to provide a comma-separated list of meson subprojects that should be built
-alongside the default ones.
-
-To use it:
-
-```sh
-# Clone into the subprojects directory
-$ git -C subprojects clone my_subproject
-# Wipe dependency detection state, in case you have an existing build dir
-$ meson setup --wipe builddir -Dcustom_subprojects=my_subproject
-$ meson compile -C builddir
-```
-
-## Run tests
-
-You can easily run the test of all the components:
-
-```
-meson test -C builddir
-```
-
-To list all available tests:
-
-```
-meson test -C builddir --list
-```
-
-To run all the tests of a specific component:
-
-```
-meson test -C builddir --suite gst-plugins-base
-```
-
-Or to run a specific test file:
-
-```
-meson test -C builddir --suite gstreamer gst_gstbuffer
-```
-
-Run a specific test from a specific test file:
-
-```
-GST_CHECKS=test_subbuffer meson test -C builddir --suite gstreamer gst_gstbuffer
-```
-
-## Optional Installation
-
-You can also install everything that is built into a predetermined prefix like
-so:
-
-```
-meson setup --prefix=/path/to/install/prefix builddir
-meson compile -C builddir
-meson install -C builddir
-```
-
-Note that the installed files have `RPATH` stripped, so you will need to set
-`LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, or `PATH` as appropriate for your
-platform for things to work.
-
-## Setup a mingw/wine based development environment on linux
-
-### Install wine and mingw
-
-#### On fedora x64
-
-``` sh
-sudo dnf install mingw64-gcc mingw64-gcc-c++ mingw64-pkg-config mingw64-winpthreads wine
-```
-
-FIXME: Figure out what needs to be installed on other distros
-
-### Get meson from git
-
-This simplifies the process and allows us to use the cross files
-defined in meson itself.
-
-``` sh
-git clone https://github.com/mesonbuild/meson.git
-```
-
-### Build and install
-
-```
-BUILDDIR=$PWD/winebuild/
-export WINEPREFIX=$BUILDDIR/wine-prefix/ && mkdir -p $WINEPREFIX
-# Setting the prefix is mandatory as it is used to setup symlinks within the development environment
-meson/meson.py $BUILDDIR --cross-file meson/cross/linux-mingw-w64-64bit.txt -Dgst-plugins-bad:vulkan=disabled -Dorc:gtk_doc=disabled --prefix=$BUILDDIR/wininstall/ -Djson-glib:gtk_doc=disabled
-meson/meson.py install -C $BUILDDIR/
-```
-
-> __NOTE__: You should use `meson install -C $BUILDDIR`  each time you make a change
-> instead of the usual `meson compile -C $BUILDDIR` as this is not in the
-> development environment.
-
-Alternatively, you can also use `mingw64-meson` on Fedora, which is a wrapper
-script that sets things up to use Fedora's cross files and settings. However,
-the wrapper script can be buggy in some cases.
-
-### cross-mingw development environment
-
-You can get into the development environment as described [above](#development-environment).
-
-After setting up [binfmt] to use wine for windows binaries,
-you can run GStreamer tools under wine by running:
-
-```
-gst-launch-1.0.exe videotestsrc ! glimagesink
-```
-
-[binfmt]: http://man7.org/linux/man-pages/man5/binfmt.d.5.html
-
-## vscode integration
-
-A file named `.vscode/launch.json.sample` can be used as a reference to debug and run
-GStreamer applications such as `gst-launch-1.0`. You just have to copy the file to
-`.vscode/launch.json` to enable the debugging session in Visual Studio Code.
+## The lock order after this change
+
+- A source buffer's object lock, then its `TRACKS` lock, then the media
+  source's object lock.
+- The append pipeline's object lock is held by its own threads outermost on
+  the initialization segment path.
+- `reset_lock` and `init_segment_lock` are leaves.
+
+## Options considered
+
+| Option | What it would take | Why not chosen |
+|---|---|---|
+| **Reset without the object lock, a reset lock, and copied track arrays** (this change) | About 110 lines in three files | Chosen: each lock guards one thing and nests inside nothing. |
+| Reset under the lock, but have `on_new_sample()` not take it | Make the append window check lock-free | The window is read with other buffer state. `on_new_sample()` would need its own copy of it, kept in step. |
+| Use the append pipeline's object lock for the track arrays | No new lock | `process_init_segment()` holds that lock on the pipeline's thread across the whole callback chain, which takes the media source's lock and then calls the other buffer's getters. Taking the other pipeline's object lock there deadlocks against that pipeline's own initialization segment. A getter called from the pipeline's own callback would deadlock on itself. |
+| Hold the media source's lock in the reset | Lock across components | The reset would then take the media source's lock while a buffer takes it the other way round, the inversion `review/07` removed. |
+
+## How it was checked
+
+There is no unit test. Both new races were made deterministic with
+temporary sleeps in a copy of the sources, never committed. These are runs
+from when the change was made, not repeated for this README.
+
+- **Two resets:** a C program against the library, since a browser's DOM
+  refuses `abort()` once the source has ended, so the double reset is not
+  reachable through it. It appends an MP4 initialization segment and a media
+  segment, then bytes that are not media, and calls `gst_source_buffer_abort()`
+  from the `on-error` handler, with a 1.5 s sleep inside the reset's tracks
+  loop for the first thread through it. Before: SIGSEGV in
+  `gst_element_get_static_pad()` from `gst_append_pipeline_reset()` on the
+  abort thread in 1 of 3 runs, three GLib criticals
+  (`'GST_IS_ELEMENT (element)' failed` in `gst_element_get_static_pad()`,
+  `gst_element_set_state()` and `gst_bin_remove()`) in 2 of 3. After: no
+  criticals, 3 of 3.
+- **Track arrays:** a browser page adds an audio and a video buffer, appends
+  the audio initialization segment, then the video one, and aborts the audio
+  buffer 300 ms later, with a 1.5 s sleep in `gst_source_buffer_get_all_tracks()`
+  between the getters and the copy, under `G_DEBUG=gc-friendly` and
+  `MALLOC_PERTURB_`. Before: the video's streaming thread faults in
+  `g_ptr_array_extend()` (SIGSEGV in 1 of 3 runs, stuck there in 2 of 3).
+  After: the page completes with one audio and one video track and no
+  criticals, 3 of 3.
+- The first problem, the reset waiting on its own lock, was not reproduced
+  on its own. The argument is the join and the lock above.
+
+At this commit, the gate on GStreamer main (2026-11-05) ran the whole unit
+test suite: `100%: Checks: 72, Failures: 0, Errors: 0`, as on the 1.28 series.
+
+## Questions a reviewer may ask
+
+- **Can a buffer's own thread race its own reset?** No. The reset stops the
+  pipeline first, which joins its streaming threads and background task, so
+  the arrays are swapped only once the buffer's own threads have stopped.
+- **Why is the reported error scheduled before the reset now?** The events
+  are queued under the lock with `updating` cleared, in the order the spec's
+  append error algorithm gives. The reset itself has no visible effect on
+  them.
+- **What do comments that mention `abort()` refer to?** This commit's
+  comments already name `abort()` as a caller of the reset. That becomes
+  true in `review/13`.
