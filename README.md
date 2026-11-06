@@ -1,580 +1,255 @@
-# GStreamer
+> One change of the GStreamer fork: `review/24`, 24 of 33 in the stack.
+> Below it: [`review/23`](https://github.com/Airodonack/gstreamer/tree/review/23). Above it: [`review/25`](https://github.com/Airodonack/gstreamer/tree/review/25).
+> The change itself: [commit 0fd7ed68a308ca9b9fd266c50d9481794858d431](https://github.com/Airodonack/gstreamer/commit/0fd7ed68a308ca9b9fd266c50d9481794858d431). This README sits in a commit on top of it and is not part of the merge request.
+> The whole stack: [overview README](https://github.com/Airodonack/gstreamer/blob/mse-fixes-main/README.md).
 
-This is GStreamer, a framework for streaming media.
+# A source reopened after its end of stream plays again
 
-## Where to start
+MSE lets a page end the stream and then append more: the append reopens the
+source, and the new media plays like any other. mselib reopened the source
+but left every layer below in its end-of-stream state, so the new media never
+played. This change takes the end of stream back at each layer: the track
+buffers, the track feeds and msesrc's pads. Since a GStreamer EOS is final
+once it is sent, msesrc now holds each pad's EOS until playback nears the end
+of what the pad pushed.
 
-We have a website at
+It is the largest change of the stack's second half after `review/23`:
+about 380 changed lines of library code in seven files, and six new unit tests.
 
-  https://gstreamer.freedesktop.org
+## The problem
 
-Our documentation, including tutorials, API reference and FAQ can be found at
+Three layers each kept the EOS:
 
-  https://gstreamer.freedesktop.org/documentation/
+- the **track buffers**, marked EOS by `gst_source_buffer_mark_eos()` at the
+  end of stream;
+- the **track feeds**, which pushed EOS and then stopped their task;
+- **msesrc's pads**, which had sent EOS downstream and refuse buffers after
+  it.
 
-You can ask questions on the GStreamer Discourse at
+A VOD player that extends the media, or appends again after seeking into an
+evicted range, hit all three:
 
-  https://discourse.gstreamer.org/
-
-We track bugs, feature requests and merge requests (patches) in GitLab at
-
-  https://gitlab.freedesktop.org/gstreamer/
-
-You can join us on our Matrix room at
-
-  https://matrix.to/#/#gstreamer:gstreamer.org
-
-This repository contains all official modules supported by the GStreamer
-community which can be found in the `subprojects/` directory.
-
-## Getting started
-
-### Install git and python 3.8+
-
-If you're on Linux, you probably already have these. On macOS, new versions of
-Xcode ship Python 3 already. If you're on an older Xcode, you can use the
-[official Python installer](https://www.python.org/downloads/mac-osx/).
-
-You can find [instructions for Windows below](#windows-development-environment).
-
-### Install meson and ninja
-
-Meson 1.4 or newer is required.
-
-On Linux and macOS you can get meson through your package manager or using:
-
-```
-$ pip3 install --user meson
-```
-
-This will install meson into `~/.local/bin` which may or may not be included
-automatically in your PATH by default.
-
-You should get `ninja` using your package manager or download the [official
-release](https://github.com/ninja-build/ninja/releases) and put the `ninja`
-binary in your PATH.
-
-You can find [instructions for Windows below](#windows-development-environment).
-
-
-If you used the official Python installer on macOS instead of the Python
-3 shipped with Xcode, you might need to execute "Install Certificates.command"
-from the Python folder in the user Applications folder:
-
-```
-$ /Applications/Python\ 3.*/Install\ Certificates.command
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as page
+    participant SB as source buffer and track buffer
+    participant F as track feed
+    participant P as msesrc pad
+    App->>SB: end_of_stream()
+    SB->>F: track buffer EOS
+    F->>P: last samples, EOS
+    F->>F: task stops
+    P->>P: pad is EOS
+    App->>SB: append more media, source reopens
+    SB->>F: new sample restarts the feed from the seek time
+    F->>P: old media again, then the new
+    P-->>F: refused, the pad is EOS
+    Note over App,P: the new media never plays
 ```
 
-Otherwise you will get this error when downloading meson wraps:
+Undoing the first two is bookkeeping. The pads are harder: in GStreamer an EOS
+is final for the stream, downstream acts on it as soon as it arrives, and only
+a flush clears it, which throws away what downstream still holds. A browser
+does not have this problem: Chromium and Firefox pull from the demuxer, and a
+decoder learns of the end only when it reads at the end. MSE's end of stream
+is a flag until then.
 
-```
-urllib.error.URLError: urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed
-```
+## The change
 
-### Build GStreamer and its modules
+**Reopen clears EOS.**
+[`gst_media_source_open()`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstmediasource.c#L580-L598),
+when it moves an ended source back to open, calls
+[`clear_all_source_buffers_eos()`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstmediasource.c#L1070-L1082),
+which clears each track buffer's EOS through
+[`gst_source_buffer_clear_eos()`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c#L2502-L2516).
+That takes each buffer's `TRACKS_LOCK`, so `append_buffer()` now reopens
+before it takes its own
+([lines 2165 to 2169](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c#L2165-L2169)).
+`remove()`, the mode setter and the `timestampOffset` setter already
+reopened before taking it. The reopen and the end of stream's marking of the
+buffers
+([`mark_all_source_buffers_eos()`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstmediasource.c#L1043-L1066))
+both run under a new `eos_lock`, and the marking happens only if the source
+is still ended, so an end of stream and a reopen on two threads leave the
+buffers' EOS matching `readyState`.
 
-You can get all GStreamer built running:
+**The feed outlives its EOS, counted.** The track buffer counts how often it
+has become EOS
+([`gst_media_source_track_buffer_eos()`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstmediasourcetrackbuffer.c#L176-L187),
+[`get_eos_count()`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstmediasourcetrackbuffer.c#L209-L214)).
+[`track_feed_task()`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c#L2021-L2098)
+pushes one EOS each time the count moves and keeps running, from where it left
+off, so the old media is not pushed again. It pushes the EOS only if the EOS
+held for the whole walk of the track buffer; if the source reopened or ended
+again during the walk, or an append changed the buffer under it
+(`GST_ITERATOR_RESYNC`), it walks again at once
+([lines 2059 to 2083](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c#L2059-L2083)).
+Otherwise an EOS read before the walk could follow media appended during it.
 
-```
-meson setup builddir
-meson compile -C builddir
-```
-
-This will automatically create the `builddir` directory and build everything
-inside it.
-
-NOTE: On Windows, meson will automatically detect and use the latest Visual
-Studio if GCC, clang, etc are not available in `PATH`. Use the `--vsenv`
-argument to force the use of Visual Studio.
-
-NOTE: Meson will not update subprojects automatically once a subproject has
-been fetched. Remember to update subprojects if wrap files are updated.
-
-```
-meson subprojects update
-```
-
-### External dependencies
-
-All mandatory dependencies of GStreamer are included as [meson subprojects](https://mesonbuild.com/Subprojects.html):
-libintl, zlib, libffi, glib. Some optional dependencies are also included as
-subprojects, such as ffmpeg, x264, json-glib, graphene, openh264, orc, etc.
-
-Mandatory dependencies will be automatically built if meson cannot find them on
-your system using pkg-config. The same is true for optional dependencies that
-are included as subprojects. You can find a full list by looking at the
-`subprojects` directory.
-
-Plugins that need optional dependencies that aren't included can only be built
-if they are provided by the system. Instructions on how to build some common
-ones such as Qt5/QML are listed below. If you do not know how to provide an
-optional dependency needed by a plugin, you should use [Cerbero](https://gitlab.freedesktop.org/gstreamer/cerbero/#description)
-which handles this for you automatically.
-
-Plugins will be automatically enabled if possible, but you can ensure that
-a particular plugin (especially if it has external dependencies) is built by
-enabling the gstreamer repository that ships it and the plugin inside it. For
-example, to enable the Qt5 plugin in the gst-plugins-good repository, you need
-to run meson as follows:
-
-```
-meson -Dgood=enabled -Dgst-plugins-good:qt5=enabled builddir
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as application thread
+    participant TB as track buffer
+    participant F as track feed
+    F->>TB: look: EOS, count 1, push EOS
+    App->>TB: reopen, EOS cleared
+    App->>TB: append, end again: EOS, count 2
+    F->>TB: look: EOS, count 2
+    Note over F: a flag "EOS already pushed" would push nothing.<br/>The count differs: the feed pushes the new media, then an EOS
 ```
 
-This will cause Meson to error out if the plugin could not be enabled. You can
-also flip the default and disable all plugins except those explicitly enabled
-like so:
+**The pad holds its EOS.** When an msesrc pad pops an EOS,
+[`hold_eos()`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstmsesrc.c#L1071-L1138)
+waits on the element's clock until running time comes within a margin of the
+end of the media the pad pushed, and only then is the EOS sent
+([lines 1298 to 1312](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstmsesrc.c#L1298-L1312)).
+The margin
+([`eos_hold_margin()`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstmsesrc.c#L1039-L1062))
+is 4 frames for video, from the last frame's duration or else the caps'
+framerate, and 0 for audio and text: a video decoder may keep its last frames
+until the EOS drains it, and Chromium's renderer keeps 4 frames queued. The
+wait ends early, through
+[`wake_eos_hold()`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstmsesrc.c#L1028-L1037),
+when the track gets media (its `on-not-empty` signal), when the pad starts
+flushing, and when the element goes to or leaves `PLAYING`; while not
+`PLAYING` it waits for `PLAYING`. New media during the wait means the source
+reopened: the EOS is dropped, and the media follows the old with nothing in
+between.
 
-```
-meson -Dauto_features=disabled -Dgstreamer:tools=enabled -Dbad=enabled -Dgst-plugins-bad:openh264=enabled
-```
-
-This will disable all optional features and then enable the `openh264` plugin
-and the tools that ship with the core gstreamer repository: `gst-inspect-1.0`,
-`gst-launch-1.0`, etc. As usual, you can change these values on a builddir that
-has already been setup with `meson configure -Doption=value`.
-
-### Building the Qt5 QML plugin
-
-If `qmake` is not in `PATH` and pkgconfig files are not available, you can
-point the `QMAKE` env var to the Qt5 installation of your choosing before
-running `meson` as shown above.
-
-The plugin will be automatically enabled if possible, but you can ensure that
-it is built by passing `-Dgood=enabled -Dgst-plugins-good:qt5=enabled` to `meson`.
-
-### Building the Intel MSDK plugin
-
-On Linux, you need to have development files for `libmfx` installed. On
-Windows, if you have the [Intel Media SDK](https://software.intel.com/en-us/media-sdk),
-it will set the `INTELMEDIASDKROOT` environment variable, which will be used by
-the build files to find `libmfx`.
-
-The plugin will be automatically enabled if possible, but you can ensure it by
-passing `-Dbad=enabled -Dgst-plugins-bad:msdk=enabled` to `meson`.
-
-### Building plugins with (A)GPL-licensed dependencies
-
-Some plugins have GPL- or AGPL-licensed dependencies and will only be built
-if you have explicitly opted in to allow (A)GPL-licensed dependencies by
-passing `-Dgpl=enabled` to Meson.
-
-List of plugins with (A)GPL-licensed dependencies (non-exhaustive) in gst-plugins-bad:
- - dts (DTS audio decoder plugin)
- - faad (Free AAC audio decoder plugin)
- - iqa (Image quality assessment plugin based on dssim-c)
- - mpeg2enc (MPEG-2 video encoder plugin)
- - mplex (audio/video multiplexer plugin)
- - ofa (Open Fingerprint Architecture library plugin)
- - resindvd (Resin DVD playback plugin)
- - x265 (HEVC/H.265 video encoder plugin)
-
-List of plugins with (A)GPL-licensed dependencies (non-exhaustive) in gst-plugins-ugly:
- - a52dec (Dolby Digital (AC-3) audio decoder plugin)
- - cdio (CD audio source plugin based on libcdio)
- - dvdread (DVD video source plugin based on libdvdread)
- - mpeg2dec (MPEG-2 video decoder plugin based on libmpeg2)
- - sidplay (Commodore 64 audio decoder plugin based on libsidplay)
- - x264 (H.264 video encoder plugin based on libx264)
-
-### Static build
-
-Since *1.18.0*, when doing a static build using `--default-library=static`,
-a shared library `gstreamer-full-1.0`, in addition to a package config file,
-will be produced and includes all enabled GStreamer plugins and libraries.
-A list of libraries that needs to be exposed in `gstreamer-full-1.0`
-ABI can be set using `gst-full-libraries` option.
-glib-2.0, gobject-2.0 and gstreamer-1.0 are always included.
-
-```
-meson setup --default-library=static -Dgst-full-libraries=gstreamer-app-1.0,gstreamer-video-1.0 builddir
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as page
+    participant F as track feed
+    participant P as msesrc pad
+    participant D as decoder and sink
+    App->>F: end_of_stream()
+    F->>P: last samples, EOS
+    P->>D: last samples
+    P->>P: holds EOS until running time nears the end
+    App->>F: append more, source reopens
+    F->>P: new samples
+    P->>P: media on the track: EOS dropped
+    P->>D: new samples, no flush, nothing lost
 ```
 
-GStreamer *1.18* requires applications using gstreamer-full-1.0 to initialize
-static plugins by calling `gst_init_static_plugins()` after `gst_init()`. That
-function is defined in `gst/gstinitstaticplugins.h` header file.
-
-Since *1.20.0*, `gst_init_static_plugins()` is called automatically by
-`gst_init()` and applications don't have to call it manually any more.
-The header file has been removed from public API.
-
-One can use the `gst-full-version-script` option to pass a
-[version script](https://www.gnu.org/software/gnulib/manual/html_node/LD-Version-Scripts.html)
-to the linker. This can be used to control the exact symbols that are exported by
-the `gstreamer-full` library, allowing the linker to garbage collect unused code
-and so, reduce the total library size. A default script
-`gstreamer-full-default.map` declares only glib/gstreamer symbols as public.
-
-One can use the `gst-full-plugins` option to pass a list of plugins to be
-registered in the `gstreamer-full` library. The default value is '*'
-which means that all the plugins selected during the build process will be
-registered statically.
-An empty value will prevent any plugins to be registered.
-
-One can select a specific set of features with `gst-full-elements`,
-`gst-full-typefind-functions`, `gst-full-device-providers`
-or `gst-full-dynamic-types` to select specific feature from a plugin.
-When a feature has been listed in one of those options, the other features from
-its plugin will no longer be automatically included, even if the plugin
-is listed in `gst-full-plugins`.
-
-The user must insure that all selected plugins and features (element,
-typefind, etc.) have been enabled during the build configuration.
-
-To register features, the syntax is the following:
-plugins are separated by ';' and features from a plugin starts after ':'
-and are ',' separated.
-
-As an example:
-
- * `-Dgst-full-plugins=coreelements;typefindfunctions;alsa;pbtypes`:
- Enable only `coreelements`, `typefindfunctions`, `alsa`, `pbtypes` plugins.
- * `-Dgst-full-elements=coreelements:filesrc,fakesink,identity;alsa:alsasrc`:
- Enable only `filesrc`, `identity` and `fakesink` elements from `coreelements`
- plugin and `alsasrc` element from `alsa` plugin.
- * `-Dgst-full-typefind-functions=typefindfunctions:wav,flv`:
- Enable only typefind func `wav` and `flv` from `typefindfunctions`
- * `-Dgst-full-device-providers=alsa:alsadeviceprovider`:
- Enable `alsadeviceprovider` from `alsa` plugin.
- * `-Dgst-full-dynamic-types=pbtypes:video_multiview_flagset`:
- Enable `video_multiview_flagset` from `pbtypes`.
-
-All features from the `playback` plugin will be enabled and the other plugins
-will be restricted to the specific features requested.
-
-All the selected features will be registered into a dedicated `NULL`
-plugin name.
-
-This will cause the features/plugins that are not registered to not be included
-in the final gstreamer-full library.
-
-This is an experimental feature, backward incompatible changes could still be
-made in the future.
-Only linux-like platforms are currently well supported when Windows, MSVC
-and MinGW, should be considered as *experimental* as the symbols export
-is still under discussion.
-
-Since 1.24.7, it is possible to disable the `gstreamer-full` library by passing
-`-Dgst-full=disabled`. This can be useful in cases where you want a static
-build of gstreamer, but you do not want to use gst-full, since linking the
-static executables associated with it can be quite CPU/RAM intensive.
-
-
-#### Full-static build
-
-Since *1.24.0*, it is also possible to link an application with GStreamer
-statically. It means that all the gstreamer libraries will be linked within
-your library or application. However, it is important to note that even though
-the `gstreamer-full` library can be statically built into the application,
-it does not contain all of the code (core libraries and plugins).
-Instead, it relies on all the other static libraries. Hence, while the
-`gstreamer-full` library provides a cohesive access point, the actual
-functionality is distributed across various static libraries.
-You can enable this option using `-Dgst-full-target-type=static_library` which
-is by default set to `shared_library`. The buildsystem will produce a set of
-archives depending on your `gstreamer-full` configuration as explained above.
-Your application can now check the `gstreamer-full` dependency within meson or
-with the package config file.
-In both case, the application can rely on the `gstreamer-full-1.0.pc` file
-generated during the build process to retrieve all its dependencies.
-In that configuration, the *features* selected during the build configuration
-will be automatically registered during the call of `gst_init()`.
-
-
-### Building documentation
-
-Documentation is not built by default because it is slow to generate. To build
-the documentation, first ensure that `hotdoc` is installed and `doc` option is
-enabled. For API documentation, gobject introspection must also be enabled.
-The special target `gst-doc` can then be used to (re)generate the documentation.
-
-```sh
-$ pip install hotdoc
-$ meson setup -Ddoc=enabled -Dintrospection=enabled builddir
-$ meson compile -C builddir gst-doc
-```
-
-NOTE: To visualize the documentation, `devhelp` can be run inside the development
-environment (see below).
-
-## Development environment
-
-### Development environment target
-
-GStreamer uses [Meson devenv](https://mesonbuild.com/Commands.html#devenv)
-to drop you into a development environment where all the plugins, libraries,
-and tools you just built are available:
-
-```
-meson devenv -C <BUILDDIR>
-```
-
-Alternatively, if you'd rather not start a shell in your workflow, you
-can mutate the current environment into a suitable state like so:
-
-```
-meson devenv -C <BUILDDIR> --dump
-```
-
-This will print output suitable for an sh-compatible `eval` function,
-just like `ssh-agent -s`.
-
-An external script can be run in development environment with:
-
-```
-meson devenv -C <BUILDDIR> external_script.sh
-```
-
-NOTE: In the development environment, a fully usable prefix is also configured
-in `gstreamer/prefix` where you can install any extra dependency/project.
-
-For more extensive documentation about the development environment go to [the
-documentation](https://gstreamer.freedesktop.org/documentation/installing/building-from-source-using-meson.html).
-
-### Bash prompt
-
-We automatically handle `bash` and set `$PS1` accordingly.
-
-If the automatic `$PS1` override is not desired (maybe you have a fancy custom
-prompt), set the `$MESON_DISABLE_PS1_OVERRIDE` environment variable to
-`TRUE` and use `$GST_ENV` when setting the custom prompt, for example with a
-snippet like the following:
-
-```bash
-...
-if [[ -n "${GST_ENV-}" ]];
-then
-  PS1+="[ ${GST_ENV} ]"
-fi
-...
-```
-
-## Windows Development Environment
-
-### Prerequisites
-
-- **Visual Studio Community 2022** (or later) with:
-  - Desktop development with C++ workload
-  - Windows SDK
-- **Python 3.8+** (required for build system and gst-env.py)
-- **Meson 1.4.0+** (install via pip: `pip install meson`)
-
-It is recommended to use Visual Studio Community 2022 and PowerShell terminal.
-
-Meson automatically detects and activates the Visual Studio toolchain when no other compilers are found.
-GStreamer should be built in a PowerShell environment for a complete user experience.
-
-NOTE: If you have other toolchains (MinGW, Clang, etc.) in your PATH, Meson may detect those instead of Visual Studio. To ensure Visual Studio is used:
-- Remove conflicting toolchains from your Windows PATH, or
-- Use the `--vsenv` flag: `meson setup --vsenv builddir`, or
-- Run from a Developer PowerShell for VS 2022 which pre-configures the environment
-
-#### Git for Windows
-
-Use the [Git for Windows](https://gitforwindows.org/) installer. It will
-install a `bash` prompt with basic shell utils and up-to-date git binaries.
-
-During installation, when prompted about `PATH`, you should select the
-following option:
-
-![Select "Git from the command line and also from 3rd-party software"](/data/images/git-installer-PATH.png)
-
-#### Python 3.8+ on Windows
-
-Use the [official Python installer](https://www.python.org/downloads/windows/).
-You must ensure that Python is installed into `PATH`:
-
-![Enable Add Python to PATH, then click Customize Installation](/data/images/py-installer-page1.png)
-
-You may also want to customize the installation and install it into
-a system-wide location such as `C:\PythonXY`, but this is not required.
-
-#### Ninja on Windows
-
-If you are using Visual Studio 2019 or newer, Ninja is already provided.
-
-In other cases, the easiest way to install Ninja on Windows is with `pip3`,
-which will download the compiled binary and place it into the `Scripts`
-directory inside your Python installation:
-
-```
-pip3 install ninja
-```
-
-You can also download the [official release](https://github.com/ninja-build/ninja/releases)
-and place it into `PATH`, or use MSYS2.
-
-#### Meson on Windows
-
-**IMPORTANT**: Do not use the Meson MSI installer since it is experimental and known to not
-work with `GStreamer`.
-
-You can use `pip3` to install Meson, same as Ninja above:
-
-```
-pip3 install meson
-```
-
-Note that Meson is written entirely in Python, so you can also run it as-is
-from the [git repository](https://github.com/mesonbuild/meson/) if you want to
-use the latest master branch for some reason.
-
-### Running Meson on Windows
-
-Meson automatically activates the Visual Studio environment on Windows if no
-other compilers (gcc, clang, etc) are found. To force the use of Visual Studio
-in such cases, you can use:
-
-```
-meson setup --vsenv builddir
-```
-
-### Building with Visual Studio
-
-```powershell
-meson setup builddir
-meson compile -C builddir
-```
-
-NOTE: You should verify that Visual Studio is being detected. Look for output similar to:
-
-```powershell
-...
-Activating VS 17.x.x
-...
-```
-
-### Powerline devenv prompt
-
-In your powerline theme configuration file (by default in
-`{POWERLINE INSTALLATION DIR}/config_files/themes/shell/default.json`)
-you should add a new environment segment as follow:
-
-```
-{
-  "function": "powerline.segments.common.env.environment",
-  "args": { "variable": "GST_ENV" },
-  "priority": 50
-},
-```
-
-## Custom subprojects
-
-We also added a meson option, `custom_subprojects`, that allows the user
-to provide a comma-separated list of meson subprojects that should be built
-alongside the default ones.
-
-To use it:
-
-```sh
-# Clone into the subprojects directory
-$ git -C subprojects clone my_subproject
-# Wipe dependency detection state, in case you have an existing build dir
-$ meson setup --wipe builddir -Dcustom_subprojects=my_subproject
-$ meson compile -C builddir
-```
-
-## Run tests
-
-You can easily run the test of all the components:
-
-```
-meson test -C builddir
-```
-
-To list all available tests:
-
-```
-meson test -C builddir --list
-```
-
-To run all the tests of a specific component:
-
-```
-meson test -C builddir --suite gst-plugins-base
-```
-
-Or to run a specific test file:
-
-```
-meson test -C builddir --suite gstreamer gst_gstbuffer
-```
-
-Run a specific test from a specific test file:
-
-```
-GST_CHECKS=test_subbuffer meson test -C builddir --suite gstreamer gst_gstbuffer
-```
-
-## Optional Installation
-
-You can also install everything that is built into a predetermined prefix like
-so:
-
-```
-meson setup --prefix=/path/to/install/prefix builddir
-meson compile -C builddir
-meson install -C builddir
-```
-
-Note that the installed files have `RPATH` stripped, so you will need to set
-`LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, or `PATH` as appropriate for your
-platform for things to work.
-
-## Setup a mingw/wine based development environment on linux
-
-### Install wine and mingw
-
-#### On fedora x64
-
-``` sh
-sudo dnf install mingw64-gcc mingw64-gcc-c++ mingw64-pkg-config mingw64-winpthreads wine
-```
-
-FIXME: Figure out what needs to be installed on other distros
-
-### Get meson from git
-
-This simplifies the process and allows us to use the cross files
-defined in meson itself.
-
-``` sh
-git clone https://github.com/mesonbuild/meson.git
-```
-
-### Build and install
-
-```
-BUILDDIR=$PWD/winebuild/
-export WINEPREFIX=$BUILDDIR/wine-prefix/ && mkdir -p $WINEPREFIX
-# Setting the prefix is mandatory as it is used to setup symlinks within the development environment
-meson/meson.py $BUILDDIR --cross-file meson/cross/linux-mingw-w64-64bit.txt -Dgst-plugins-bad:vulkan=disabled -Dorc:gtk_doc=disabled --prefix=$BUILDDIR/wininstall/ -Djson-glib:gtk_doc=disabled
-meson/meson.py install -C $BUILDDIR/
-```
-
-> __NOTE__: You should use `meson install -C $BUILDDIR`  each time you make a change
-> instead of the usual `meson compile -C $BUILDDIR` as this is not in the
-> development environment.
-
-Alternatively, you can also use `mingw64-meson` on Fedora, which is a wrapper
-script that sets things up to use Fedora's cross files and settings. However,
-the wrapper script can be buggy in some cases.
-
-### cross-mingw development environment
-
-You can get into the development environment as described [above](#development-environment).
-
-After setting up [binfmt] to use wine for windows binaries,
-you can run GStreamer tools under wine by running:
-
-```
-gst-launch-1.0.exe videotestsrc ! glimagesink
-```
-
-[binfmt]: http://man7.org/linux/man-pages/man5/binfmt.d.5.html
-
-## vscode integration
-
-A file named `.vscode/launch.json.sample` can be used as a reference to debug and run
-GStreamer applications such as `gst-launch-1.0`. You just have to copy the file to
-`.vscode/launch.json` to enable the debugging session in Visual Studio Code.
+**The pad resumes after an EOS it did send.** If the source reopens inside the
+margin or after the end, the EOS is already out. A pad that is EOS and pops a
+sample flushes (`flush-start`, then `flush-stop` with `reset_time` false,
+since playback goes on from where it ended) and sends its segment again; a pad
+that is EOS and pops another EOS drops it
+([lines 1165 to 1193](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstmsesrc.c#L1165-L1193)).
+A seek sets the pad flushing before its own `flush-start`
+([`flush_stream()`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstmsesrc.c#L820-L854)),
+and the pad does not resume while flushing, so its `flush-stop` cannot undo
+a seek's `flush-start`.
+
+## Options considered
+
+| Option | Why not chosen |
+|---|---|
+| **Hold the EOS until playback nears the end** (this change) | Chosen: a reopen before the end loses nothing, and at a real end the EOS still comes on time. It follows the browsers' model: the end reaches the decoder when playback gets there. |
+| Flush the pad on new media after an EOS, with no hold | Measured below: drops up to 0.8 s of video and 1.6 s of audio that downstream had queued, and a reopen after the decoder saw the EOS froze video. Kept only for a reopen after the EOS left. |
+| A `STREAM_START` behind the EOS instead of a flush | The EOS still reaches the sinks: GstPlay ended at the old end and the H.264 decoder stopped. It also needs `review/01`'s `queue` fix. |
+| Hold with no margin | The last 3 video frames came up to 100 ms late at a real end. |
+| A fixed 200 ms margin | Does not follow the frame rate. |
+| Restart the feeds on reopen | A restarted feed walks from the seek time and replays what was pushed, the bug itself. |
+| A boolean "EOS pushed" in the feed | Misses an end, a reopen and an end between two looks (diagram above). |
+
+## What it costs
+
+- An EOS comes up to 4 video frames before the end of the media, in running
+  time, instead of when the last sample was pushed. A pipeline with
+  `sync=false` sinks gets its EOS in real time, not as fast as it can run.
+- Video with neither a frame duration nor a framerate falls back to a margin
+  of 0.
+- Each track feed now runs until the source buffer goes, and wakes once a
+  second to walk its track buffer.
+
+## Spec
+
+[MSE, prepare append algorithm](https://w3c.github.io/media-source/#sourcebuffer-prepare-append),
+step 5:
+
+> If the readyState attribute of the parent media source is in the "ended"
+> state then run the following steps: Set the readyState attribute of the
+> parent media source to "open". Queue a task to fire an event named
+> sourceopen at the parent media source.
+
+`remove()`, the `mode` setter and the `timestampOffset` setter take back an
+end of stream the same way. Media appended then is processed like any other,
+and [HTML's ended playback](https://html.spec.whatwg.org/multipage/media.html#ended-playback)
+is the current playback position reaching the end of the media, which the hold
+keeps for msesrc.
+
+## How it was checked
+
+Unit tests in `tests/check/libs/mse.c`, msesrc into fakesinks:
+
+- [`test_media_source_element_plays_after_reopen`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/tests/check/libs/mse.c#L2247-L2328):
+  an end of stream, a reopen by a setter that ends again with no media, a
+  reopen by an append (which deadlocks if `append_buffer()` takes its tracks
+  lock before reopening) and a second end of stream; it fails before this
+  change, with no buffer reaching the sinks after the first EOS (commit
+  message).
+- [`test_media_source_element_ends_after_append_during_feed`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/tests/check/libs/mse.c#L2357-L2425):
+  reopens and appends while the feeds may still be pushing; no old media may
+  follow an EOS.
+- [`test_media_source_element_keeps_queued_media_on_reopen`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/tests/check/libs/mse.c#L2553-L2654):
+  each pad's media held in a multiqueue across the end and the reopen, on a
+  test clock at the start; every buffer pushed before the reopen reaches the
+  sink, and each pad pushes one EOS.
+- [`test_media_source_element_holds_eos_until_end`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/tests/check/libs/mse.c#L2678-L2797):
+  no EOS before the test clock reaches the end, one after.
+- [`test_media_source_element_seeks_while_resuming`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/tests/check/libs/mse.c#L2843-L2914):
+  a seek while the pads resume; nothing is pushed inside the seek's flush.
+- [`test_media_source_end_of_stream_races_reopen`](https://github.com/Airodonack/gstreamer/blob/0fd7ed68a308ca9b9fd266c50d9481794858d431/subprojects/gst-plugins-bad/tests/check/libs/mse.c#L2942-L3023):
+  an end of stream on one thread and a reopen on another.
+
+The other msesrc tests run on a pipeline whose running time is an hour in, so
+their EOS comes at once. The races need temporary delays to fail before the
+change (the feed's snapshot, a slow feed walk, the pad's resume, the end of
+stream's marking); those runs are from the review of 2026-11-04 and are not
+repeated here. The two hold tests failed before the hold and pass with it
+(2026-11-05).
+
+The gate on GStreamer main (2026-11-05), the whole suite at this commit:
+`100%: Checks: 94, Failures: 0, Errors: 0`, as on the 1.28 series.
+
+Measured on 2026-11-05 in a pipeline shaped like a browser's: GstPlay over
+playbin3, `decodebin3`, `playsink`, sinks that sync, the H.264 decoder
+openh264dec, 30 fps media. A page reopens and appends at a lead before the old
+end. Each cell is the largest gap in the timestamps of the buffers reaching the sinks, in ms (3 runs each, every run the same):
+
+| Lead before the old end | Flush, video | Flush, audio | Hold, video | Hold, audio |
+|---|---|---|---|---|
+| 2000 ms | 833 | 1625 | 0 | 0 |
+| 500 ms | 567 | 488 | 0 | 0 |
+| 100 ms | 167 | 70 | 0 | 0 |
+| 50 ms | 100 | 23 | 100 | 0 |
+
+At 100 ms the flush build's video also stopped for good (GstPlay "stopped"
+in 3 of 3); with the hold it played on. At 50 ms, inside the 4-frame margin
+of 133 ms, the EOS has left and both builds stop. At a real end with the hold,
+no frame was more than 2 ms late, and GstPlay ended as before.
+
+## Questions a reviewer may ask
+
+- **What if the pipeline has no clock, or never goes to `PLAYING`?** With no
+  clock the EOS goes at once: sinks without a clock do not wait either. In
+  `PAUSED` the EOS is held, as the end is not reached.
+- **A sink with `sync=false`?** The EOS waits for real running time.
+- **Does the flush of a late reopen disturb the other tracks?** It goes down
+  this pad's branch only.
+- **Lock order of the reopen:** `gst_media_source_open()` runs under the
+  calling buffer's object lock and takes every buffer's `TRACKS_LOCK` in
+  turn. Object lock before `TRACKS_LOCK` is the series' order. `eos_lock`
+  comes after a source buffer's object lock and before the media source's
+  object lock and the buffers' `TRACKS_LOCK`: a reopen is called under a
+  buffer's object lock but never under its tracks lock, as the comment on
+  `gst_media_source_open()` says.
+- **The test comment "mselib applies the timestamp offset only there"**
+  (sequence mode) is true at this commit. `review/28` makes it false and
+  does not update it.
