@@ -1,580 +1,265 @@
-# GStreamer
+> One change of the GStreamer fork: `review/23`, 23 of 33 in the stack.
+> Below it: [`review/22`](https://github.com/Airodonack/gstreamer/tree/review/22). Above it: [`review/24`](https://github.com/Airodonack/gstreamer/tree/review/24).
+> The change itself: [commit fd62b474f284ba9bce65c751a212738852f2ddda](https://github.com/Airodonack/gstreamer/commit/fd62b474f284ba9bce65c751a212738852f2ddda). This README sits in a commit on top of it and is not part of the merge request.
+> The whole stack: [overview README](https://github.com/Airodonack/gstreamer/blob/mse-fixes-main/README.md).
 
-This is GStreamer, a framework for streaming media.
+# An MP4 initialization segment alone now exposes its tracks
 
-## Where to start
+A source buffer learns its tracks from the initialization segment. In
+mselib they appeared only with the first media segment. Players and
+web-platform-tests wait for `loadedmetadata` before they append any media,
+so they waited for good. This change takes the tracks from the demuxer,
+which parses the initialization segment, instead of from the pads
+`parsebin` exposes later.
 
-We have a website at
+It is the second of two changes: `review/22` reports an initialization
+segment once, and this one gives MP4 buffers caps so that `parsebin` plugs
+qtdemux without typefinding, then makes the tracks from qtdemux. On the 1.28
+series these are two commits; on main they are one, since the caps alone
+fail this change's test there (`h264parse` has no stream-id before its first
+frame). It is the largest commit of the second half of the stack, and it
+was redesigned on 2026-11-02 for a change in upstream `parsebin`. Both the
+problem and the reasons for the design are below.
 
-  https://gstreamer.freedesktop.org
+## Background: the append pipeline
 
-Our documentation, including tutorials, API reference and FAQ can be found at
+Each source buffer parses its bytes in a small private pipeline:
 
-  https://gstreamer.freedesktop.org/documentation/
-
-You can ask questions on the GStreamer Discourse at
-
-  https://discourse.gstreamer.org/
-
-We track bugs, feature requests and merge requests (patches) in GitLab at
-
-  https://gitlab.freedesktop.org/gstreamer/
-
-You can join us on our Matrix room at
-
-  https://matrix.to/#/#gstreamer:gstreamer.org
-
-This repository contains all official modules supported by the GStreamer
-community which can be found in the `subprojects/` directory.
-
-## Getting started
-
-### Install git and python 3.8+
-
-If you're on Linux, you probably already have these. On macOS, new versions of
-Xcode ship Python 3 already. If you're on an older Xcode, you can use the
-[official Python installer](https://www.python.org/downloads/mac-osx/).
-
-You can find [instructions for Windows below](#windows-development-environment).
-
-### Install meson and ninja
-
-Meson 1.4 or newer is required.
-
-On Linux and macOS you can get meson through your package manager or using:
-
-```
-$ pip3 install --user meson
+```mermaid
+flowchart LR
+    A["appsrc<br/>the appended bytes"] --> PB
+    subgraph PB["parsebin"]
+      TF["typefind"] --> DM["demuxer<br/>qtdemux, matroskademux"]
+      DM -- "one pad per track" --> P1["parser<br/>h264parse"]
+      DM --> P2["parser<br/>aacparse, mpegaudioparse"]
+    end
+    P1 -- "exposed pad" --> S1["appsink, track video-0"]
+    P2 -- "exposed pad" --> S2["appsink, track audio-1"]
 ```
 
-This will install meson into `~/.local/bin` which may or may not be included
-automatically in your PATH by default.
+Before this change, a track was made when `parsebin` exposed a pad, and the
+initialization segment was reported when every stream of `parsebin`'s
+stream collection had a track.
 
-You should get `ninja` using your package manager or download the [official
-release](https://github.com/ninja-build/ninja/releases) and put the `ninja`
-binary in your PATH.
+## The problem
 
-You can find [instructions for Windows below](#windows-development-environment).
+Three things stood between the initialization segment and the tracks.
 
+1. **Typefinding needs more bytes.** With no caps on `appsrc`, `parsebin`
+   runs typefind first, and an `ftyp` plus `moov`, a kilobyte or two, does
+   not let it decide. Nothing is plugged until a media segment brings more
+   bytes.
+2. **A parser without caps holds its pad back.** Once the demuxer
+   is plugged, `parsebin` exposes a stream only when the parser behind it
+   has fixed caps
+   ([gstparsebin.c, the caps wait](https://github.com/Airodonack/gstreamer/blob/74f679f8de/subprojects/gst-plugins-base/gst/playback/gstparsebin.c#L1599-L1615)).
+   `h264parse` and `aacparse` take theirs from the sample description;
+   `mpegaudioparse` needs its first frame. One such stream holds back the
+   whole group, so `mse.mp4` (H.264, MPEG audio, text) exposed nothing.
+3. **On GStreamer main, not in 1.28, a parser without a stream-id holds
+   its pad back too.** Upstream `parsebin` now treats a parsed chain as complete only
+   once the parser's pad has a stream-id
+   ([main, `gst_parse_chain_is_complete`](https://github.com/Airodonack/gstreamer/blob/74f679f8de/subprojects/gst-plugins-base/gst/playback/gstparsebin.c#L3160-L3170);
+   on 1.28.6 a plugged parser was enough,
+   [lines 3151 to 3154](https://github.com/Airodonack/gstreamer/blob/1.28.6/subprojects/gst-plugins-base/gst/playback/gstparsebin.c#L3151-L3154)).
+   `h264parse` makes its stream-id with its first frame, and a `moov` has
+   none. So even H.264 waits for media.
 
-If you used the official Python installer on macOS instead of the Python
-3 shipped with Xcode, you might need to execute "Install Certificates.command"
-from the Python folder in the user Applications folder:
+Probed for the earlier README, on stock GStreamer 1.28.7 (nixpkgs), `appsrc ! parsebin` fed only an
+initialization segment and watched for 3 s (probe below):
 
-```
-$ /Applications/Python\ 3.*/Install\ Certificates.command
-```
+| Bytes | appsrc caps | What happened |
+|---|---|---|
+| `mse.mp4` up to its first `moof` (H.264, MPEG audio, text) | none | nothing plugged, no pad |
+| same | `video/quicktime, variant=iso` | qtdemux plugged; its 3 pads, each with caps and stream-id, and `no-more-pads` at 11 ms; **no pad exposed** |
+| `mse-h264-aac-init.mp4` (H.264, AAC) | none | nothing plugged, no pad |
+| same | `video/quicktime, variant=iso` | qtdemux's 2 pads and `no-more-pads` at 9 ms; both exposed at 10 to 11 ms, H.264's without caps |
+| WebM header up to the first Cluster | none | nothing plugged, no pad |
+| same | `video/webm` | matroskademux's pads and `no-more-pads` at 8 ms; no pad exposed in 3 s |
 
-Otherwise you will get this error when downloading meson wraps:
+The demuxer knew every track within milliseconds in every case where it
+was plugged. Waiting for `parsebin`'s exposure is what lost them.
 
-```
-urllib.error.URLError: urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed
-```
-
-### Build GStreamer and its modules
-
-You can get all GStreamer built running:
-
-```
-meson setup builddir
-meson compile -C builddir
-```
-
-This will automatically create the `builddir` directory and build everything
-inside it.
-
-NOTE: On Windows, meson will automatically detect and use the latest Visual
-Studio if GCC, clang, etc are not available in `PATH`. Use the `--vsenv`
-argument to force the use of Visual Studio.
-
-NOTE: Meson will not update subprojects automatically once a subproject has
-been fetched. Remember to update subprojects if wrap files are updated.
-
-```
-meson subprojects update
-```
-
-### External dependencies
-
-All mandatory dependencies of GStreamer are included as [meson subprojects](https://mesonbuild.com/Subprojects.html):
-libintl, zlib, libffi, glib. Some optional dependencies are also included as
-subprojects, such as ffmpeg, x264, json-glib, graphene, openh264, orc, etc.
-
-Mandatory dependencies will be automatically built if meson cannot find them on
-your system using pkg-config. The same is true for optional dependencies that
-are included as subprojects. You can find a full list by looking at the
-`subprojects` directory.
-
-Plugins that need optional dependencies that aren't included can only be built
-if they are provided by the system. Instructions on how to build some common
-ones such as Qt5/QML are listed below. If you do not know how to provide an
-optional dependency needed by a plugin, you should use [Cerbero](https://gitlab.freedesktop.org/gstreamer/cerbero/#description)
-which handles this for you automatically.
-
-Plugins will be automatically enabled if possible, but you can ensure that
-a particular plugin (especially if it has external dependencies) is built by
-enabling the gstreamer repository that ships it and the plugin inside it. For
-example, to enable the Qt5 plugin in the gst-plugins-good repository, you need
-to run meson as follows:
-
-```
-meson -Dgood=enabled -Dgst-plugins-good:qt5=enabled builddir
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as page
+    participant AP as append pipeline
+    participant QT as qtdemux
+    participant PB as parsebin
+    App->>AP: append ftyp + moov
+    AP->>QT: plugged, thanks to caps on appsrc
+    QT->>QT: pads video_0, audio_0, subtitle_0<br/>with caps and stream-id
+    QT->>PB: no-more-pads
+    PB->>PB: mpegaudioparse has no caps,<br/>on main h264parse has no stream-id
+    Note over AP,PB: no pad exposed, no stream collection,<br/>no tracks, no HAVE_METADATA
+    App->>App: waits for loadedmetadata before appending media
 ```
 
-This will cause Meson to error out if the plugin could not be enabled. You can
-also flip the default and disable all plugins except those explicitly enabled
-like so:
+## The change
 
-```
-meson -Dauto_features=disabled -Dgstreamer:tools=enabled -Dbad=enabled -Dgst-plugins-bad:openh264=enabled
-```
+### Caps on appsrc
 
-This will disable all optional features and then enable the `openh264` plugin
-and the tools that ship with the core gstreamer repository: `gst-inspect-1.0`,
-`gst-launch-1.0`, etc. As usual, you can change these values on a builddir that
-has already been setup with `meson configure -Doption=value`.
+- [`gst_source_buffer_new()`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c#L326-L332)
+  notes whether the MIME type is `video/mp4` or `audio/mp4`, and if so gives
+  the append pipeline `video/quicktime, variant=iso` caps
+  ([lines 361 to 366](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstsourcebuffer.c#L361-L366)).
+- The new private
+  [`gst_append_pipeline_set_caps()`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L1240-L1247)
+  sets them on `appsrc`, so `parsebin` plugs qtdemux at once.
 
-### Building the Qt5 QML plugin
+WebM buffers get no caps and still typefind, which waits for the first
+Cluster.
 
-If `qmake` is not in `PATH` and pkgconfig files are not available, you can
-point the `QMAKE` env var to the Qt5 installation of your choosing before
-running `meson` as shown above.
+### Tracks from the demuxer
 
-The plugin will be automatically enabled if possible, but you can ensure that
-it is built by passing `-Dgood=enabled -Dgst-plugins-good:qt5=enabled` to `meson`.
+The append pipeline watches `parsebin` for the
+container demuxer and makes the tracks from the demuxer's pads; `parsebin`'s
+pads, whenever they come, only carry the samples.
 
-### Building the Intel MSDK plugin
-
-On Linux, you need to have development files for `libmfx` installed. On
-Windows, if you have the [Intel Media SDK](https://software.intel.com/en-us/media-sdk),
-it will set the `INTELMEDIASDKROOT` environment variable, which will be used by
-the build files to find `libmfx`.
-
-The plugin will be automatically enabled if possible, but you can ensure it by
-passing `-Dbad=enabled -Dgst-plugins-bad:msdk=enabled` to `meson`.
-
-### Building plugins with (A)GPL-licensed dependencies
-
-Some plugins have GPL- or AGPL-licensed dependencies and will only be built
-if you have explicitly opted in to allow (A)GPL-licensed dependencies by
-passing `-Dgpl=enabled` to Meson.
-
-List of plugins with (A)GPL-licensed dependencies (non-exhaustive) in gst-plugins-bad:
- - dts (DTS audio decoder plugin)
- - faad (Free AAC audio decoder plugin)
- - iqa (Image quality assessment plugin based on dssim-c)
- - mpeg2enc (MPEG-2 video encoder plugin)
- - mplex (audio/video multiplexer plugin)
- - ofa (Open Fingerprint Architecture library plugin)
- - resindvd (Resin DVD playback plugin)
- - x265 (HEVC/H.265 video encoder plugin)
-
-List of plugins with (A)GPL-licensed dependencies (non-exhaustive) in gst-plugins-ugly:
- - a52dec (Dolby Digital (AC-3) audio decoder plugin)
- - cdio (CD audio source plugin based on libcdio)
- - dvdread (DVD video source plugin based on libdvdread)
- - mpeg2dec (MPEG-2 video decoder plugin based on libmpeg2)
- - sidplay (Commodore 64 audio decoder plugin based on libsidplay)
- - x264 (H.264 video encoder plugin based on libx264)
-
-### Static build
-
-Since *1.18.0*, when doing a static build using `--default-library=static`,
-a shared library `gstreamer-full-1.0`, in addition to a package config file,
-will be produced and includes all enabled GStreamer plugins and libraries.
-A list of libraries that needs to be exposed in `gstreamer-full-1.0`
-ABI can be set using `gst-full-libraries` option.
-glib-2.0, gobject-2.0 and gstreamer-1.0 are always included.
-
-```
-meson setup --default-library=static -Dgst-full-libraries=gstreamer-app-1.0,gstreamer-video-1.0 builddir
+```mermaid
+sequenceDiagram
+    autonumber
+    participant PB as parsebin, streaming thread
+    participant AP as append pipeline
+    participant QT as qtdemux
+    participant SB as source buffer
+    PB->>AP: deep-element-added qtdemux
+    AP->>QT: connect no-more-pads, before parsebin does
+    QT->>QT: parse moov, add pads with stream-id and caps
+    QT->>AP: no-more-pads
+    AP->>AP: one track per audio, video, text pad<br/>sorted video, audio, text, stream-id<br/>appsink made, not linked
+    AP->>QT: duration query
+    AP->>SB: init segment received
+    SB->>SB: track buffers, active, HAVE_METADATA
+    Note over PB,AP: later, with the first media segment
+    PB->>AP: pad-added, stream-id S1
+    AP->>AP: find_track(S1), link pad to its appsink
 ```
 
-GStreamer *1.18* requires applications using gstreamer-full-1.0 to initialize
-static plugins by calling `gst_init_static_plugins()` after `gst_init()`. That
-function is defined in `gst/gstinitstaticplugins.h` header file.
-
-Since *1.20.0*, `gst_init_static_plugins()` is called automatically by
-`gst_init()` and applications don't have to call it manually any more.
-The header file has been removed from public API.
-
-One can use the `gst-full-version-script` option to pass a
-[version script](https://www.gnu.org/software/gnulib/manual/html_node/LD-Version-Scripts.html)
-to the linker. This can be used to control the exact symbols that are exported by
-the `gstreamer-full` library, allowing the linker to garbage collect unused code
-and so, reduce the total library size. A default script
-`gstreamer-full-default.map` declares only glib/gstreamer symbols as public.
-
-One can use the `gst-full-plugins` option to pass a list of plugins to be
-registered in the `gstreamer-full` library. The default value is '*'
-which means that all the plugins selected during the build process will be
-registered statically.
-An empty value will prevent any plugins to be registered.
-
-One can select a specific set of features with `gst-full-elements`,
-`gst-full-typefind-functions`, `gst-full-device-providers`
-or `gst-full-dynamic-types` to select specific feature from a plugin.
-When a feature has been listed in one of those options, the other features from
-its plugin will no longer be automatically included, even if the plugin
-is listed in `gst-full-plugins`.
-
-The user must insure that all selected plugins and features (element,
-typefind, etc.) have been enabled during the build configuration.
-
-To register features, the syntax is the following:
-plugins are separated by ';' and features from a plugin starts after ':'
-and are ',' separated.
-
-As an example:
-
- * `-Dgst-full-plugins=coreelements;typefindfunctions;alsa;pbtypes`:
- Enable only `coreelements`, `typefindfunctions`, `alsa`, `pbtypes` plugins.
- * `-Dgst-full-elements=coreelements:filesrc,fakesink,identity;alsa:alsasrc`:
- Enable only `filesrc`, `identity` and `fakesink` elements from `coreelements`
- plugin and `alsasrc` element from `alsa` plugin.
- * `-Dgst-full-typefind-functions=typefindfunctions:wav,flv`:
- Enable only typefind func `wav` and `flv` from `typefindfunctions`
- * `-Dgst-full-device-providers=alsa:alsadeviceprovider`:
- Enable `alsadeviceprovider` from `alsa` plugin.
- * `-Dgst-full-dynamic-types=pbtypes:video_multiview_flagset`:
- Enable `video_multiview_flagset` from `pbtypes`.
-
-All features from the `playback` plugin will be enabled and the other plugins
-will be restricted to the specific features requested.
-
-All the selected features will be registered into a dedicated `NULL`
-plugin name.
-
-This will cause the features/plugins that are not registered to not be included
-in the final gstreamer-full library.
-
-This is an experimental feature, backward incompatible changes could still be
-made in the future.
-Only linux-like platforms are currently well supported when Windows, MSVC
-and MinGW, should be considered as *experimental* as the symbols export
-is still under discussion.
-
-Since 1.24.7, it is possible to disable the `gstreamer-full` library by passing
-`-Dgst-full=disabled`. This can be useful in cases where you want a static
-build of gstreamer, but you do not want to use gst-full, since linking the
-static executables associated with it can be quite CPU/RAM intensive.
-
-
-#### Full-static build
-
-Since *1.24.0*, it is also possible to link an application with GStreamer
-statically. It means that all the gstreamer libraries will be linked within
-your library or application. However, it is important to note that even though
-the `gstreamer-full` library can be statically built into the application,
-it does not contain all of the code (core libraries and plugins).
-Instead, it relies on all the other static libraries. Hence, while the
-`gstreamer-full` library provides a cohesive access point, the actual
-functionality is distributed across various static libraries.
-You can enable this option using `-Dgst-full-target-type=static_library` which
-is by default set to `shared_library`. The buildsystem will produce a set of
-archives depending on your `gstreamer-full` configuration as explained above.
-Your application can now check the `gstreamer-full` dependency within meson or
-with the package config file.
-In both case, the application can rely on the `gstreamer-full-1.0.pc` file
-generated during the build process to retrieve all its dependencies.
-In that configuration, the *features* selected during the build configuration
-will be automatically registered during the call of `gst_init()`.
-
-
-### Building documentation
-
-Documentation is not built by default because it is slow to generate. To build
-the documentation, first ensure that `hotdoc` is installed and `doc` option is
-enabled. For API documentation, gobject introspection must also be enabled.
-The special target `gst-doc` can then be used to (re)generate the documentation.
-
-```sh
-$ pip install hotdoc
-$ meson setup -Ddoc=enabled -Dintrospection=enabled builddir
-$ meson compile -C builddir gst-doc
-```
-
-NOTE: To visualize the documentation, `devhelp` can be run inside the development
-environment (see below).
-
-## Development environment
-
-### Development environment target
-
-GStreamer uses [Meson devenv](https://mesonbuild.com/Commands.html#devenv)
-to drop you into a development environment where all the plugins, libraries,
-and tools you just built are available:
-
-```
-meson devenv -C <BUILDDIR>
-```
-
-Alternatively, if you'd rather not start a shell in your workflow, you
-can mutate the current environment into a suitable state like so:
-
-```
-meson devenv -C <BUILDDIR> --dump
-```
-
-This will print output suitable for an sh-compatible `eval` function,
-just like `ssh-agent -s`.
-
-An external script can be run in development environment with:
-
-```
-meson devenv -C <BUILDDIR> external_script.sh
-```
-
-NOTE: In the development environment, a fully usable prefix is also configured
-in `gstreamer/prefix` where you can install any extra dependency/project.
-
-For more extensive documentation about the development environment go to [the
-documentation](https://gstreamer.freedesktop.org/documentation/installing/building-from-source-using-meson.html).
-
-### Bash prompt
-
-We automatically handle `bash` and set `$PS1` accordingly.
-
-If the automatic `$PS1` override is not desired (maybe you have a fancy custom
-prompt), set the `$MESON_DISABLE_PS1_OVERRIDE` environment variable to
-`TRUE` and use `$GST_ENV` when setting the custom prompt, for example with a
-snippet like the following:
-
-```bash
-...
-if [[ -n "${GST_ENV-}" ]];
-then
-  PS1+="[ ${GST_ENV} ]"
-fi
-...
-```
-
-## Windows Development Environment
-
-### Prerequisites
-
-- **Visual Studio Community 2022** (or later) with:
-  - Desktop development with C++ workload
-  - Windows SDK
-- **Python 3.8+** (required for build system and gst-env.py)
-- **Meson 1.4.0+** (install via pip: `pip install meson`)
-
-It is recommended to use Visual Studio Community 2022 and PowerShell terminal.
-
-Meson automatically detects and activates the Visual Studio toolchain when no other compilers are found.
-GStreamer should be built in a PowerShell environment for a complete user experience.
-
-NOTE: If you have other toolchains (MinGW, Clang, etc.) in your PATH, Meson may detect those instead of Visual Studio. To ensure Visual Studio is used:
-- Remove conflicting toolchains from your Windows PATH, or
-- Use the `--vsenv` flag: `meson setup --vsenv builddir`, or
-- Run from a Developer PowerShell for VS 2022 which pre-configures the environment
-
-#### Git for Windows
-
-Use the [Git for Windows](https://gitforwindows.org/) installer. It will
-install a `bash` prompt with basic shell utils and up-to-date git binaries.
-
-During installation, when prompted about `PATH`, you should select the
-following option:
-
-![Select "Git from the command line and also from 3rd-party software"](/data/images/git-installer-PATH.png)
-
-#### Python 3.8+ on Windows
-
-Use the [official Python installer](https://www.python.org/downloads/windows/).
-You must ensure that Python is installed into `PATH`:
-
-![Enable Add Python to PATH, then click Customize Installation](/data/images/py-installer-page1.png)
-
-You may also want to customize the installation and install it into
-a system-wide location such as `C:\PythonXY`, but this is not required.
-
-#### Ninja on Windows
-
-If you are using Visual Studio 2019 or newer, Ninja is already provided.
-
-In other cases, the easiest way to install Ninja on Windows is with `pip3`,
-which will download the compiled binary and place it into the `Scripts`
-directory inside your Python installation:
-
-```
-pip3 install ninja
-```
-
-You can also download the [official release](https://github.com/ninja-build/ninja/releases)
-and place it into `PATH`, or use MSYS2.
-
-#### Meson on Windows
-
-**IMPORTANT**: Do not use the Meson MSI installer since it is experimental and known to not
-work with `GStreamer`.
-
-You can use `pip3` to install Meson, same as Ninja above:
-
-```
-pip3 install meson
-```
-
-Note that Meson is written entirely in Python, so you can also run it as-is
-from the [git repository](https://github.com/mesonbuild/meson/) if you want to
-use the latest master branch for some reason.
-
-### Running Meson on Windows
-
-Meson automatically activates the Visual Studio environment on Windows if no
-other compilers (gcc, clang, etc) are found. To force the use of Visual Studio
-in such cases, you can use:
-
-```
-meson setup --vsenv builddir
-```
-
-### Building with Visual Studio
-
-```powershell
-meson setup builddir
-meson compile -C builddir
-```
-
-NOTE: You should verify that Visual Studio is being detected. Look for output similar to:
-
-```powershell
-...
-Activating VS 17.x.x
-...
-```
-
-### Powerline devenv prompt
-
-In your powerline theme configuration file (by default in
-`{POWERLINE INSTALLATION DIR}/config_files/themes/shell/default.json`)
-you should add a new environment segment as follow:
-
-```
-{
-  "function": "powerline.segments.common.env.environment",
-  "args": { "variable": "GST_ENV" },
-  "priority": 50
-},
-```
-
-## Custom subprojects
-
-We also added a meson option, `custom_subprojects`, that allows the user
-to provide a comma-separated list of meson subprojects that should be built
-alongside the default ones.
-
-To use it:
-
-```sh
-# Clone into the subprojects directory
-$ git -C subprojects clone my_subproject
-# Wipe dependency detection state, in case you have an existing build dir
-$ meson setup --wipe builddir -Dcustom_subprojects=my_subproject
-$ meson compile -C builddir
-```
-
-## Run tests
-
-You can easily run the test of all the components:
-
-```
-meson test -C builddir
-```
-
-To list all available tests:
-
-```
-meson test -C builddir --list
-```
-
-To run all the tests of a specific component:
-
-```
-meson test -C builddir --suite gst-plugins-base
-```
-
-Or to run a specific test file:
-
-```
-meson test -C builddir --suite gstreamer gst_gstbuffer
-```
-
-Run a specific test from a specific test file:
-
-```
-GST_CHECKS=test_subbuffer meson test -C builddir --suite gstreamer gst_gstbuffer
-```
-
-## Optional Installation
-
-You can also install everything that is built into a predetermined prefix like
-so:
-
-```
-meson setup --prefix=/path/to/install/prefix builddir
-meson compile -C builddir
-meson install -C builddir
-```
-
-Note that the installed files have `RPATH` stripped, so you will need to set
-`LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, or `PATH` as appropriate for your
-platform for things to work.
-
-## Setup a mingw/wine based development environment on linux
-
-### Install wine and mingw
-
-#### On fedora x64
-
-``` sh
-sudo dnf install mingw64-gcc mingw64-gcc-c++ mingw64-pkg-config mingw64-winpthreads wine
-```
-
-FIXME: Figure out what needs to be installed on other distros
-
-### Get meson from git
-
-This simplifies the process and allows us to use the cross files
-defined in meson itself.
-
-``` sh
-git clone https://github.com/mesonbuild/meson.git
-```
-
-### Build and install
-
-```
-BUILDDIR=$PWD/winebuild/
-export WINEPREFIX=$BUILDDIR/wine-prefix/ && mkdir -p $WINEPREFIX
-# Setting the prefix is mandatory as it is used to setup symlinks within the development environment
-meson/meson.py $BUILDDIR --cross-file meson/cross/linux-mingw-w64-64bit.txt -Dgst-plugins-bad:vulkan=disabled -Dorc:gtk_doc=disabled --prefix=$BUILDDIR/wininstall/ -Djson-glib:gtk_doc=disabled
-meson/meson.py install -C $BUILDDIR/
-```
-
-> __NOTE__: You should use `meson install -C $BUILDDIR`  each time you make a change
-> instead of the usual `meson compile -C $BUILDDIR` as this is not in the
-> development environment.
-
-Alternatively, you can also use `mingw64-meson` on Fedora, which is a wrapper
-script that sets things up to use Fedora's cross files and settings. However,
-the wrapper script can be buggy in some cases.
-
-### cross-mingw development environment
-
-You can get into the development environment as described [above](#development-environment).
-
-After setting up [binfmt] to use wine for windows binaries,
-you can run GStreamer tools under wine by running:
-
-```
-gst-launch-1.0.exe videotestsrc ! glimagesink
-```
-
-[binfmt]: http://man7.org/linux/man-pages/man5/binfmt.d.5.html
-
-## vscode integration
-
-A file named `.vscode/launch.json.sample` can be used as a reference to debug and run
-GStreamer applications such as `gst-launch-1.0`. You just have to copy the file to
-`.vscode/launch.json` to enable the debugging session in Visual Studio Code.
+The pieces, all in `gstappendpipeline.c`:
+
+| Code | What it does |
+|---|---|
+| [`on_deep_element_added`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L1024-L1047), [`is_container_demuxer`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L1009-L1022) | The first demuxer `parsebin` plugs, not a tag demuxer such as id3demux, gets a `no-more-pads` handler. The signal fires inside `gst_bin_add()`, before `parsebin` connects its own handlers to the element ([gstparsebin.c, `connect_element`](https://github.com/Airodonack/gstreamer/blob/74f679f8de/subprojects/gst-plugins-base/gst/playback/gstparsebin.c#L2405-L2415)), so ours runs first. The handler is connected in [the init function](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L1144-L1147). |
+| [`on_demuxer_no_more_pads`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L952-L1007), [`add_demuxer_stream`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L896-L913) | Reads each demuxer pad's stream-id and current caps, sorts them with [`compare_demuxer_streams`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L883-L894), makes a track for each new one and reports the initialization segment, unless nothing was added and one was already reported. |
+| [`check_track`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L512-L532), [`append_track`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L536-L561), [`link_track`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L563-L579), [`find_track`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L592-L603) | The old `add_track()` split in three: whether a stream can be a track, making the track with an unlinked appsink, and linking a `parsebin` pad later. A track now carries its stream-id. |
+| [`process_init_segment_track`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L647-L703) | On `parsebin`'s `pad-added`: a pad whose stream-id names a known track is linked to it. Otherwise the old path, a new track for the pad. |
+| [`report_init_segment`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L752-L772) | Takes the duration from the element that parsed the header. |
+| [`find_track_with_new_id`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L915-L948), [`unlink_track`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L581-L590) | A later initialization segment whose only track of a type has a new stream-id continues that track instead of adding one; with more than one track of a type, the ids must match. |
+| [`gst_append_pipeline_stream_type_from_caps`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L808-L848) | The stream type of a demuxer pad's caps, with the pbutils description as a fallback, so WebVTT and SSA get one; it brings `gstpbutils_dep` into mselib's `meson.build`. |
+| [`process_init_segment`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L778-L803) | The old report, kept for bytes without a demuxer (ADTS AAC, MPEG audio) and for a demuxer that never says `no-more-pads`, with `review/22`'s guard; it returns early once the demuxer path has reported. |
+
+Why each detail:
+
+- **The stream-id matches.** Parsers are `GstBaseParse` subclasses and pass
+  the demuxer's `stream-start` on unchanged, so the pad `parsebin` exposes
+  for a track has the demuxer pad's stream-id.
+- **The order is `parsebin`'s.** Tracks are named by position
+  (`video-0`, `audio-1`), and after a reset a track object is reused for
+  the same type and name (`review/11`). Sorting video, audio, text, then
+  stream-id, as `parsebin`'s
+  [`sort_end_pads`](https://github.com/Airodonack/gstreamer/blob/74f679f8de/subprojects/gst-plugins-base/gst/playback/gstparsebin.c#L3486-L3570)
+  does, keeps names independent of the container's track order (`review/29` tests it).
+- **The duration comes from the demuxer.** Probed for the earlier README, on 1.28.7, with the
+  `mvhd` duration of `mse-h264-aac-init.mp4` set to 4 s: at `no-more-pads`
+  a duration query answered 4.0 s on qtdemux and nothing on `parsebin`;
+  `parsebin` answered 4.0 s only after it had exposed pads.
+- **A track's first caps are the demuxer's**, for H.264 qtdemux's `avc`
+  caps with `codec_data`, width and height. The parser's caps reach msesrc
+  with the first sample, as any caps change does.
+
+## Options considered
+
+The first version of this work (until 2026-11-02) did only the caps on
+appsrc and kept tracks from exposed pads. On 1.28 it worked for H.264 and
+AAC but not for MPEG audio in MP4. On main, after upstream's stream-id
+change, four unit tests failed: an MP4 initialization segment exposed no
+H.264 pad. With that upstream change reverted in a scratch build, all
+passed: `100%: Checks: 141, Failures: 0, Errors: 0` (2026-11-02).
+
+| Option | What it would take | Why not chosen |
+|---|---|---|
+| **Tracks from the demuxer's pads, `parsebin` pads matched by stream-id** (this change) | About 470 changed lines in the append pipeline | Chosen: the demuxer is where the header is parsed, so it holds on 1.28 and main, for MPEG audio as for H.264, and does not depend on when `parsebin` exposes. |
+| Caps on appsrc only (the 1.28 series' first commit of the two) | 25 lines | Fails for any stream whose parser needs a frame (MPEG audio on 1.28) and for H.264 on main. |
+| Ask upstream to expose a parser whose caps are fixed before its stream-id | A change to `parsebin` | Upstream made the change on purpose, so that a collection is never built from one stream-id and then followed by another. Even granted, MPEG audio would still wait for its caps, and mselib would stay tied to exposure timing. |
+| Make tracks from `parsebin`'s stream collection | Small | `parsebin` posts the collection when it exposes ([gst_parse_bin_expose](https://github.com/Airodonack/gstreamer/blob/74f679f8de/subprojects/gst-plugins-base/gst/playback/gstparsebin.c#L3669-L3678)), so it comes no earlier. The probe saw no collection for `mse.mp4` in 3 s. |
+| Caps on appsrc for WebM too | One flag | matroskademux then gives its pads from the header alone, but no pad is exposed before the first Cluster on 1.28. Left for a decision; see the cost below. |
+| A typefind helper that accepts a lone `moov` | A change to the typefinder | It changes typefinding for every user, to answer what the MIME type already answers. |
+| Replace `parsebin` with mselib's own typefind and demuxer | A new parsing layer | Much more code, and the parsers are still needed to frame H.264 and AAC as the decoders want. |
+
+## The cost
+
+- Two ways to get tracks: the demuxer path and the exposed-pad path for
+  bytes without a demuxer. Both are tested, but they are two.
+- A track's initial caps are the demuxer's, not the parser's; msesrc
+  announces the parser's caps as a caps change on the first sample.
+- WebM is not helped yet: WebM source buffers get no caps, so typefinding
+  waits for the first Cluster. With `video/webm` caps, matroskademux gives
+  the tracks from the header alone (table above). Turning that on is one
+  flag in `review/26`'s table, left for a decision.
+
+## Spec
+
+[MSE, Initialization Segment Received](https://w3c.github.io/media-source/#sourcebuffer-init-segment-received):
+the tracks, with their codecs, are those the initialization segment
+describes; once every source buffer has had its first one, the media
+element goes to `HAVE_METADATA`. Nothing in it waits for media.
+
+## How it was checked
+
+Unit tests in `tests/check/libs/mse.c`, failing before this change as the
+commit message records:
+
+- [`test_source_buffer_init_segment_alone_activates`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/tests/check/libs/mse.c#L1918-L1964):
+  an H.264 and AAC initialization segment alone
+  (`tests/files/mse-h264-aac-init.mp4`, new with this change) makes the
+  buffer active;
+  so does `mse.mp4`'s H.264, MPEG audio and text, and its media segment
+  then adds none. On 1.28 the MPEG audio case failed, on main both.
+- [`test_append_pipeline_init_segment_alone_has_tracks`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/tests/check/libs/mse.c#L1084-L1123):
+  one report, two tracks, H.264 and MPEG-4 audio caps with `codec_data`,
+  and the 4 s duration of the patched `mvhd`. Failed on main.
+- [`test_append_pipeline_media_segment_feeds_init_segment_tracks`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/tests/check/libs/mse.c#L1216-L1270):
+  the media segment's samples all go to the initialization segment's
+  tracks, no track is added and no second report comes. Failed on both.
+
+New with them, for the details above:
+[`_init_segment_new_track_id`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/tests/check/libs/mse.c#L1125-L1157) (a lone video track whose
+stream-id changes keeps its track),
+[`_init_segment_webvtt_track`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/tests/check/libs/mse.c#L1159-L1181) and
+[`_stream_type_from_caps`](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/tests/check/libs/mse.c#L1183-L1214).
+
+The gate on GStreamer main (2026-11-05), the whole suite at this commit,
+three runs: `100%: Checks: 88, Failures: 0, Errors: 0`. On the 1.28 series, where this is two commits, the
+caps alone gave 83 checks and both together 88, all passing. The `parsebin` probe above was run for the
+earlier README, on stock 1.28.7, with Python probes kept outside the
+repository.
+
+## Questions a reviewer may ask
+
+- **Why `video/quicktime` for `audio/mp4` too?** GStreamer's typefinder
+  names ISO BMFF bytes `video/quicktime, variant=iso` whatever their tracks,
+  and qtdemux takes those caps; the change gives the same caps typefinding
+  would have given.
+
+- **What if a demuxer never says `no-more-pads`?** The exposed-pad path
+  still reports once every stream of the collection has a track.
+- **What about a demuxer pad without caps or stream-id at `no-more-pads`?**
+  It is skipped, and the initialization segment is reported without it. If
+  `parsebin` later exposes the pad, it gets a track through the exposed-pad
+  path, but no report follows: with a demuxer, `process_init_segment()`
+  stops once a report was made. If no pad qualified, an initialization
+  segment with no tracks is reported, where the spec runs the append error
+  algorithm. qtdemux and matroskademux set caps before adding a pad, so
+  neither reaches this.
+- **A later initialization segment with fewer tracks, without a reset.**
+  The demuxer path adds nothing and does not report it, so the spec's
+  track-count check does not run for it. `review/31` adds that check, for reports that come. Not tested here.
+- **The bus task writes `self->streams` without the object lock**
+  ([lines 406 to 414](https://github.com/Airodonack/gstreamer/blob/fd62b474f284ba9bce65c751a212738852f2ddda/subprojects/gst-plugins-bad/gst-libs/gst/mse/gstappendpipeline.c#L406-L414)),
+  while the streaming thread reads it under the lock. That is upstream's
+  and not changed here.
+- **Two tracks of one type with swapped track ids** in a later
+  initialization segment would come up in stream-id order, so the reused
+  track objects could swap. `review/29` covers the reorder across types only.
